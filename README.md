@@ -32,7 +32,7 @@ EarlyDetectionHBOC/
 
 ### 2. Download or Clone This Repository
 ```bash
-git clone https://github.com/ErikEnsminger/EarlyDetectionHBOC.git
+git clone https://github.com/pughlab/EarlyDetectionHBOC.git
 cd EarlyDetectionHBOC
 ```
 
