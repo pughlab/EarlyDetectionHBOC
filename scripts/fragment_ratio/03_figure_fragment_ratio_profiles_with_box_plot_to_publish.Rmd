@@ -1,0 +1,322 @@
+---
+title: "fragment_ratio_profiles_with_boxplot"
+output: html_document
+date: "2024-12-05"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(data.table)
+library(cowplot)
+library(stringr)
+library(here)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+date <- Sys.Date();
+```
+
+
+
+```{r}
+# Output directories
+outdir <- here::here("figures", "fragment_ratio")
+outdir_figures <- here::here("figures", "fragment_ratio")
+outdir_data <- here::here("data", "fragment_ratio")
+
+# Import data (Starting with the 5Mb ratios)
+data_ratio <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_per5Mb_fragment_ratios.csv")
+data_normal <- here::here("data", "HBOC_pipeline_output", "control", "control_per5Mb_fragment_ratios.csv")
+
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet = "April22")
+
+# Remove failed samples
+samples <- samples[!grepl("CHARMQ_0788_Pl_T_PG_T-788", samples$`Library Name`), ]
+samples <- samples[!grepl("CHARMQ_0207_Pl_T_PG_T-207", samples$`Library Name`), ]
+
+# de_table <- read.delim(here::here("data", "fragment_ratio_differential.txt"))
+print(data_ratio)
+```
+
+```{r}
+# read in data
+data_ratio <- read.csv(data_ratio, header=TRUE)
+# remove PALB2 samples 
+data_ratio <- data_ratio[, !grepl("TGL49_0311", colnames(data_ratio))]
+
+data_ratio <- data_ratio[, !colnames(data_ratio) %in% c("CHARMQ_0788_Pl_T_PG_T-788", "CHARMQ_0207_Pl_T_PG_T-207")]
+
+data_normal <- read.csv(data_normal, header=TRUE)
+
+# remove the fragment ratio chromosome location that seems to be noise 
+#data_ratio <- data_ratio[!(data_ratio$seqnames == "chr6" & data_ratio$start == "30100000"),]
+# data_normal <- data_normal[!(data_normal$seqnames == "chr6" & data_normal$start == "30100000"),]
+```
+
+```{r}
+colnames(samples)[colnames(samples) == "Library Name"] <- "sWGS"
+colnames(samples)[colnames(samples) == "source"] <- "diag"
+### Keep only plasma samples and order based on clinical information
+samples <- samples[samples$sWGS %in% colnames(data_ratio), ]
+#samples$diag <- "HBOC"
+```
+
+```{r}
+### Format ratios
+data_ratio <- data_ratio[, c("seqnames", "arm", "start", "end", samples$sWGS)]
+data_ratio <- merge(data_ratio, data_normal, by = c("seqnames", "arm", "start", "end"))
+data_ratio <- data_ratio[order(factor(data_ratio$seqnames, levels = c(paste0("chr", 1:22))),
+                               data_ratio$start), ]
+data_ratio$bin <- c(1:nrow(data_ratio))
+
+```
+
+```{r}
+data_melt <- reshape2::melt(data_ratio, id = c("seqnames", "arm", "start", "end", "bin"))
+data_melt <- merge(data_melt, samples, by.x = "variable", by.y = "sWGS", all = TRUE)
+# Replace NA values in the 'diag' column only
+data_melt$diag[is.na(data_melt$diag)] <- "HBC"
+data_melt$diag <- factor(data_melt$diag,
+                                     levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "HBC"),
+                                     labels = c("Cancer Positive (First Positive)", "Cancer Positive (Survivor)", "Cancer Negative (Survivor No)", "Cancer Negative (Survivor)", "HBC"))
+data_melt <- data_melt[order(data_melt$variable,
+                             data_melt$bin), ]
+
+```
+
+```{r}
+### Make medians for each cluster
+rows <- data_ratio[, c(1:4)]
+rows$bin <- c(1:nrow(rows))
+cohort <- rowMedians(as.matrix(data_ratio[, colnames(data_ratio) %in% samples$sWGS]))
+
+median_table <- cbind(rows, cohort)
+median_melt <- reshape2::melt(median_table, id = c("seqnames", "arm" , "start", "end", "bin"))
+
+median_melt <- median_melt[order(median_melt$bin), ]
+```
+
+
+```{r}
+### Make healthy median
+median <- rowMedians(as.matrix(data_normal[, !(colnames(data_normal) %in% colnames(rows))]))
+sd <- rowSds(as.matrix(data_normal[, !(colnames(data_normal) %in% colnames(rows))]))
+hbc_median <- cbind(rows, median, sd)
+```
+
+```{r}
+### Compare variability between HBOC and healthy
+HBOC_sd <- rowSds(as.matrix(data_ratio[, colnames(data_ratio)[colnames(data_ratio) %in% samples$sWGS]]))
+neg_surv_no_sd <- rowSds(as.matrix(data_ratio[, colnames(data_ratio)[colnames(data_ratio) %in% samples$sWGS[samples$diag == "cancer_status_negative_survivor_no"]]]))
+neg_surv_yes_sd <- rowSds(as.matrix(data_ratio[, colnames(data_ratio)[colnames(data_ratio) %in% samples$sWGS[samples$diag == "cancer_status_negative_survivor_yes"]]]))
+first_pos_sd <- rowSds(as.matrix(data_ratio[, colnames(data_ratio)[colnames(data_ratio) %in% samples$sWGS[samples$diag == "first_positive_survivor_no"]]]))
+pos_surv_yes_sd <- rowSds(as.matrix(data_ratio[, colnames(data_ratio)[colnames(data_ratio) %in% samples$sWGS[samples$diag == "cancer_status_positive_survivor_yes"]]]))
+diff_HBOC <- mean(HBOC_sd/hbc_median$sd)
+diff_neg_surv_no <- mean(neg_surv_no_sd/hbc_median$sd)
+diff_neg_surv_yes <- mean(neg_surv_yes_sd/hbc_median$sd)
+diff_first_pos <- mean(first_pos_sd/hbc_median$sd)
+diff_pos_surv_yes <- mean(pos_surv_yes_sd/hbc_median$sd)
+```
+
+```{r}
+sd_diff_df <- data.frame(
+  group = c(
+    "HBOC SD to Control", 
+    "CN-SN SD SD to Control", 
+    "CN-SY SD SD to Control", 
+    "CP-FP SD SD to Control", 
+    "CP-SY SD SD to Control"
+  ),
+  sd_diff = c(
+    diff_HBOC, 
+    diff_neg_surv_no, 
+    diff_neg_surv_yes, 
+    diff_first_pos, 
+    diff_pos_surv_yes
+  )
+)
+
+write.csv(sd_diff_df, file = file.path(outdir_data, "03_figure_fragment_ratio_standard_deviation_differences.csv"), row.names = FALSE)
+```
+
+```{r}
+# Plot profiles
+mytheme <- theme_classic(base_size = 13) + 
+  theme(
+    axis.text.x       = element_blank(),
+    axis.ticks.x      = element_blank(),
+    axis.line         = element_line(colour = "black", size = 0.6),
+
+    strip.text.x      = element_text(size = 12),  # chromosome arms
+    strip.text.y      = element_blank(),          # you had these blank
+
+    axis.title.x      = element_text(size = 16),  # x‐axis label
+    axis.title.y      = element_text(size = 16),  # y‐axis label
+    axis.text.y       = element_text(size = 12),  # y‐axis ticks
+
+    plot.title        = element_text(size = 18),  # main title
+
+    legend.position   = "none",
+    legend.title      = element_text(size = 12),
+    legend.text       = element_text(size = 12),
+
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    strip.background  = element_rect(fill = "white", color = "white"),
+
+    panel.spacing.x   = unit(0.2, "lines")
+  )
+```
+
+```{r}
+armlevels <- c("1p","1q","2p","2q","3p","3q","4p","4q","5p","5q","6p","6q",
+               "7p","7q","8p","8q", "9p", "9q","10p","10q","11p","11q","12p",
+               "12q","13q","14q","15q","16p","16q","17p","17q","18p","18q",
+               "19p", "19q","20p","20q","21q","22q")
+data_melt$arm <- factor(data_ratio$arm, levels=armlevels)
+median_melt$arm <- factor(data_ratio$arm, levels=armlevels)
+hbc_median$arm <- factor(data_ratio$arm, levels=armlevels)
+
+```
+
+```{r}
+arm <- data_ratio %>% group_by(arm) %>%
+  dplyr::summarize(n=n()) %>%
+  mutate(arm = as.character(arm))
+small.arms <- setNames(c("", "10q", "", "12q", "", "16",
+                         "", "17q", "", "18q",
+                         "", "", "", "",
+                         "", ""),
+                       c("10p", "10q", "12p", "12q", "16p", "16q",
+                         "17p", "17q", "18p", "18q",
+                         "19p", "19q", "20p", "20q",
+                         "21q", "22q"))
+arm.labels <- setNames(arm$arm, arm$arm)
+arm.labels[names(small.arms)] <- small.arms
+```
+
+```{r}
+#HBOC vs HBC
+g2 <- ggplot() + 
+  geom_line(data = data_melt, aes(x = bin, y = value, group = variable), linewidth = 0.25, alpha = 0.25) + 
+  ggtitle("Fragmentation Profiles") +
+  labs(x="Chromosome", y="Normalized Fragment Ratio", color="") + 
+  facet_grid(diag ~ arm, switch = "x",space = "free_x", scales = "free_x", labeller = labeller(arm = arm.labels)) + 
+  coord_cartesian(xlim = NULL, ylim=c(-.08,.08), expand = TRUE) + 
+  mytheme
+
+g2
+```
+
+
+
+```{r}
+# ggsave(file.path(outdir_figures, "figure_fragment_ratio_profiles.pdf"), g2, width = 12, height = 7)
+```
+
+### Correlation plot 
+```{r}
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+samples <- samples[,c("Library Name", "source")]
+
+samples <- samples[!(is.na(samples$`Library Name`)),]
+# read in data 
+scores_path <- here::here("data", "fragment_ratio", "02_fragment_ratio_genome_healthy_correlation.txt")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE, sep='\t')
+scores <- scores[,c("sample", "correlation")]
+```
+
+```{r}
+merged_data <- merge(samples, scores, by.x="Library Name", by.y = "sample", all.y=TRUE)
+merged_data$source <- ifelse(is.na(merged_data$source), "Control", merged_data$source)
+
+#fragment_ratio_cutoff 
+control_corr <- merged_data$correlation[merged_data$source == "Control"]
+fragment_ratio_cutoff <- as.numeric(quantile(control_corr, 0.01, na.rm = TRUE, names = FALSE))
+
+```
+
+```{r}
+merged_data$source <- factor(
+  merged_data$source,
+  levels = c(
+    "Control",
+    "cancer_status_negative_survivor_yes",
+    "cancer_status_negative_survivor_no",
+    "cancer_status_positive_survivor_yes",
+    "first_positive_survivor_no"
+  ),
+  labels = c(
+    "Healthy",
+    "Cancer Negative (Survivor Yes)",
+    "Cancer Negative (Survivor No)",
+    "Cancer Positive (Survivor Yes)",
+    "Cancer Positive (First Positive)"
+  )
+)
+```
+
+```{r}
+theme_corr_plot <- 
+  theme_minimal() + 
+  theme(
+    legend.position = "right",
+    panel.grid = element_blank(),
+    #plot.title = element_text(hjust = -1),
+    axis.line.x = element_line(color = "black"),
+    axis.text.y = element_text(size = 12, face = "bold"), # Font size for y-axis labels
+    axis.title.y = element_blank(), 
+    axis.ticks.x = element_line(color = "black", size = 1), 
+    axis.text.x = element_text(
+      margin = margin(t = 10, r = 0, b = 0, l = 0),  # Add space above the x-axis labels
+      size = 12,
+      angle=90),
+    axis.title.x = element_text(size=12)
+    )
+   
+```
+
+```{r}
+# Wrap y-axis labels and ensure ordering is preserved
+library(stringr)
+merged_data$source_wrapped <- factor(
+  str_wrap(merged_data$source, width = 20), 
+  levels = str_wrap(levels(merged_data$source), width = 20)  # Ensure original order is maintained
+)
+```
+
+```{r, warning=FALSE}
+# Create the horizontal box plot with black boxes
+plot <- ggplot(merged_data, aes(x = correlation, y = source_wrapped)) +
+  geom_violin(outlier.shape = NA, color = "black", alpha = 0.5) +  # Black box outline with no fill
+  geom_point(alpha = 1, color = "black") +  # Add individual points in black
+  geom_vline(xintercept = fragment_ratio_cutoff, color = "red", linetype = "dashed", size = 1.2) +  # Add vertical dashed line
+  labs(x = "Fragment Ratio Correlation to Healthy", y = "Source", title = "Fragment Ratio Correlation \n to Healthy") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_discrete(position = "right") +
+  scale_x_reverse(breaks = seq(0, 1, by = 0.1)) +
+  theme_corr_plot
+```
+
+```{r}
+# ggsave(file.path(outdir, "fragment_ratio_correlation_plot.pdf"), plot = plot, width = 8, height = 6)
+```
+
+```{r}
+# Combine the plots side by side
+combined_plot <- plot_grid(g2, plot, ncol = 2, align = "hv", axis = "tb", rel_widths = c(4.5, 1))
+```
+
+```{r}
+# Save the combined plot
+ggsave(file.path(outdir_figures, "03_figure_fragment_ratio_plots_combined.pdf"), combined_plot, width = 16.5, height = 10)
+```
+

@@ -1,0 +1,426 @@
+---
+title: "04_metrics_integrated_score_info_for_cohort_to_publish"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# Define output directories
+outdir_figures <- here::here("figures", "metrics", "04_metrics_integration_score")
+outdir_data <- here::here("data", "metrics", "04_metrics_integration_score")
+
+# Create directories if they do not exist
+for (dir in c(outdir_figures, outdir_data)) {
+  if (!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+}
+```
+
+```{r}
+# read in data 
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+sample_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(sample_path, sheet="April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+
+# remove the failed CHARMQ samples
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("group_id", "Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive")]
+```
+
+```{r}
+data <- merge(samples, scores, by.x = c("group_id", "Library Name", "TS"), by.y = c("group_id", "Library Name", "TS"), all.y = TRUE)
+data <- data %>% dplyr::select(group_id, LIB_ID, `Library Name`, TS, everything())
+
+data$TS[data$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+data$TS[data$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+data$TS[data$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+data$TS[data$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+# remove 2 CHARMQ samples
+data <- data[!grepl("T-788-T0", data$group_id), ]
+data <- data[!grepl("T-207-T0", data$group_id), ]
+
+# remove cfMeDIP samples 
+data <- data[!grepl("LIB-04-0649-T0", data$group_id), ]
+data <- data[!grepl("LIB-04-0441-T1", data$group_id), ]
+data <- data[!grepl("LIB-04-0024-T2", data$group_id), ]
+data <- data[!grepl("LIB-04-0131-T0", data$group_id), ]
+
+# Remove rows where months_to_positive == UNK or pending 
+data <- data[!grepl("UNK|pending", data$months_to_positive), ]
+
+
+```
+
+
+```{r}
+# remove the samples where TS is missing 
+data <- data[!data$group_id %in% c("LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0154-T0", "LIB-04-0664-T0"), ]
+
+# remove samples where WGS is missing 
+data <- data[!data$group_id %in% c("LIB-04-0154-T1"),]
+```
+
+```{r}
+
+# Setup factors (no \n in internal labels)
+data$source <- factor(
+  data$source,
+  levels = c(
+    "first_positive_survivor_no",
+    "cancer_status_positive_survivor_yes",
+    "cancer_status_negative_survivor_no",
+    "cancer_status_negative_survivor_yes"
+  ),
+  labels = c(
+    "Cancer Positive (First Positive)",
+    "Cancer Positive (Survivor Yes)",
+    "Cancer Negative (Survivor No)",
+    "Cancer Negative (Survivor Yes)"
+  )
+)
+
+# Create display labels with line breaks for plots only
+source_display_labels <- c(
+  "Cancer Positive (First Positive)" = "Cancer Positive\n(First Positive)",
+  "Cancer Positive (Survivor Yes)" = "Cancer Positive\n(Survivor Yes)",
+  "Cancer Negative (Survivor No)" = "Cancer Negative\n(Survivor No)",
+  "Cancer Negative (Survivor Yes)" = "Cancer Negative\n(Survivor Yes)"
+)
+
+data$cancer_status <- factor(
+  data$cancer_status,
+  levels = c("positive", "negative"),
+  labels = c("Positive", "Negative")
+)
+
+# Color palettes
+source_colors <- c(
+  "Cancer Positive (Survivor Yes)"   = "#f4c842",
+  "Cancer Negative (Survivor Yes)"   = "#1f77b4",
+  "Cancer Positive (First Positive)" = "#f87544",
+  "Cancer Negative (Survivor No)"    = "#9467bd"
+)
+
+cancer_status_colors <- c(
+  "Positive" = "red",
+  "Negative" = "gray"
+)
+
+# Ensure output directory exists
+if (!dir.exists(outdir_figures)) dir.create(outdir_figures, recursive = TRUE)
+
+# Combined storage for all p-values
+all_pvalues_combined <- data.frame()
+
+## --------------------------
+## Group-wise (by `source`)
+## --------------------------
+cat("Processing integrated_ctDNA_score by group\n")
+pvals_group <- compare_means(
+  formula = integrated_ctDNA_score ~ source,
+  data = data,
+  method = "wilcox.test",
+  p.adjust.method = "holm",
+  paired = FALSE,
+  na.rm = TRUE
+)
+
+# Add metric and comparison type info to group results
+pvals_group$metric <- "integrated_ctDNA_score"
+pvals_group$comparison_type <- "by_group"
+
+max_val <- max(data$integrated_ctDNA_score, na.rm = TRUE)
+min_val <- min(data$integrated_ctDNA_score, na.rm = TRUE)
+range_val <- max_val - min_val
+
+# Filter significant results FIRST
+pvals_group_sig <- pvals_group[pvals_group$p.adj < 0.05, ]
+
+# Calculate bracket positions ONLY for significant results
+if (nrow(pvals_group_sig) > 0) {
+  base_y <- max_val + 0.02 * range_val
+  pvals_group_sig$y.position <- base_y + seq_len(nrow(pvals_group_sig)) * 0.04 * range_val
+  pvals_group_sig$label <- pvals_group_sig$p.signif
+  # Position stars above their corresponding brackets
+  pvals_group_sig$y.position <- pvals_group_sig$y.position + 0.015 * range_val
+}
+
+p1 <- ggplot(data, aes(x = source, y = integrated_ctDNA_score)) +
+  geom_boxplot(aes(fill = source), outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_fill_manual(values = source_colors) +
+  scale_x_discrete(labels = source_display_labels) +
+  labs(
+    title = "Integrated Cancer Score by BRCA1/2m-carrier Group",
+    y = "Integrated Cancer Score",
+    x = "BRCA1/2m-carrier Group"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+if (nrow(pvals_group_sig) > 0) {
+  p1 <- p1 + stat_pvalue_manual(pvals_group_sig,
+    label = "label", y.position = "y.position", tip.length = 0.00, size = 5) +
+    coord_cartesian(ylim = c(min_val * 0.95, max(pvals_group_sig$y.position) * 1.05))
+}
+
+## -----------------------------
+## Status-wise (by `cancer_status`)
+## -----------------------------
+cat("Processing integrated_ctDNA_score by status\n")
+pvals_status <- compare_means(
+  formula = integrated_ctDNA_score ~ cancer_status,
+  data = data,
+  method = "wilcox.test",
+  p.adjust.method = "holm",
+  paired = FALSE,
+  na.rm = TRUE
+)
+
+# Add metric and comparison type info to status results
+pvals_status$metric <- "integrated_ctDNA_score"
+pvals_status$comparison_type <- "by_status"
+
+max_val2 <- max(data$integrated_ctDNA_score, na.rm = TRUE)
+min_val2 <- min(data$integrated_ctDNA_score, na.rm = TRUE)
+range_val2 <- max_val2 - min_val2
+
+# Filter significant results FIRST
+pvals_status_sig <- pvals_status[pvals_status$p.adj < 0.05, ]
+
+# Calculate bracket positions ONLY for significant results
+if (nrow(pvals_status_sig) > 0) {
+  base_y2 <- max_val2 + 0.02 * range_val2
+  pvals_status_sig$y.position <- base_y2 + seq_len(nrow(pvals_status_sig)) * 0.04 * range_val2
+  pvals_status_sig$label <- pvals_status_sig$p.signif
+  # Position stars above their corresponding brackets
+  pvals_status_sig$y.position <- pvals_status_sig$y.position + 0.015 * range_val2
+}
+
+p2 <- ggplot(data, aes(x = cancer_status, y = integrated_ctDNA_score)) +
+  geom_boxplot(aes(fill = cancer_status), outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_fill_manual(values = cancer_status_colors) +
+  labs(
+    title = "Integrated Cancer Score by Cancer Status",
+    y = "Integrated Cancer Score",
+    x = "Cancer Status"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+if (nrow(pvals_status_sig) > 0) {
+  p2 <- p2 + stat_pvalue_manual(pvals_status_sig,
+    label = "label", y.position = "y.position", tip.length = 0.00, size = 5) +
+    coord_cartesian(ylim = c(min_val2 * 0.95, max(pvals_status_sig$y.position) * 1.05))
+}
+
+# Save individual plots
+ggsave(
+  filename = file.path(outdir_figures, "04_figure_integrated_ctDNA_by_group.pdf"),
+  plot = p1, width = 8, height = 6
+)
+
+ggsave(
+  filename = file.path(outdir_figures, "04_figure_integrated_ctDNA_by_status.pdf"),
+  plot = p2, width = 8, height = 6
+)
+
+# --- Save combined plot ---
+combined_plot <- ggarrange(p1, p2, ncol = 2, align = "hv")
+ggsave(
+  filename = file.path(outdir_figures, "04_figure_integrated_ctDNA_combined.pdf"),
+  plot = combined_plot, width = 12, height = 6
+)
+
+# Combine both group and status results
+all_pvalues_combined <- rbind(pvals_group, pvals_status)
+
+# Export combined table with both p and p.adj values
+if (nrow(all_pvalues_combined) > 0) {
+  write.table(
+    all_pvalues_combined[, c("metric", "comparison_type", ".y.", "group1", "group2", "p", "p.adj", "p.signif")],
+    file = file.path(outdir_data, "wilcox_pvalues_integrated_ctDNA_all_comparisons.tsv"),
+    sep = "\t", quote = FALSE, row.names = FALSE
+  )
+  
+  # Also create a version with only significant results
+  all_pvalues_combined_sig <- all_pvalues_combined[all_pvalues_combined$p.adj < 0.05, ]
+  if (nrow(all_pvalues_combined_sig) > 0) {
+    write.table(
+      all_pvalues_combined_sig[, c("metric", "comparison_type", ".y.", "group1", "group2", "p", "p.adj", "p.signif")],
+      file = file.path(outdir_data, "wilcox_pvalues_integrated_ctDNA_significant_only.tsv"),
+      sep = "\t", quote = FALSE, row.names = FALSE
+    )
+  }
+}
+```
+
+# Summarize integration score results.
+```{r}
+summarize_ctdna_metric <- function(samples, metric_col, is_positive_fn, label) {
+  # Helper function to get mode
+  get_mode <- function(v) {
+    uniqv <- unique(v)
+    uniqv[which.max(tabulate(match(v, uniqv)))]
+  }
+
+  positive_samples <- samples[is_positive_fn(samples[[metric_col]]), ]
+  total_valid <- nrow(samples)
+  count_pos <- nrow(positive_samples)
+  percent_pos <- round(count_pos / total_valid * 100, 1)
+
+  cat("\n==========", label, "==========\n")
+  cat("Total valid samples:", total_valid, "\n")
+  cat("Number of positive samples:", count_pos, "\n")
+  cat("Percentage of valid samples:", percent_pos, "%\n")
+
+  # --- Clinical cancer status summary ---
+  cat("\nClinical cancer status (all samples):\n")
+  clinical_counts <- table(samples$cancer_status)
+  print(clinical_counts)
+  cat("Percentages:\n")
+  print(round(prop.table(clinical_counts) * 100, 1))
+
+  # --- Breakdown of positive samples by cancer_status ---
+  cat("\nBy cancer_status (within positive samples):\n")
+  cs_table <- table(positive_samples$cancer_status)
+  print(cs_table)
+  cat("Percentages:\n")
+  print(round(prop.table(cs_table) * 100, 1))
+
+  # --- Breakdown of positive samples by source ---
+  cat("\nBy source (within positive samples):\n")
+  src_table <- table(positive_samples$source)
+  print(src_table)
+  cat("Percentages:\n")
+  print(round(prop.table(src_table) * 100, 1))
+
+  # --- LIB_IDs ---
+  cat("\nUnique LIB_IDs (positive samples):", length(unique(positive_samples$LIB_ID)), "\n")
+
+  # --- Cancer-negative breakdown ---
+  neg_total <- nrow(samples[samples$cancer_status == "negative", ])
+  neg_pos <- nrow(positive_samples[positive_samples$cancer_status == "negative", ])
+  cat("\nOf", neg_total, "cancer-negative samples,", neg_pos, "are positive for this analysis\n")
+  cat("=>", round(neg_pos / neg_total * 100, 1), "% of cancer-negative samples are positive\n")
+
+  # --- Cancer-positive breakdown ---
+  pos_total <- nrow(samples[samples$cancer_status == "positive", ])
+  pos_pos <- nrow(positive_samples[positive_samples$cancer_status == "positive", ])
+  cat("Of", pos_total, "cancer-positive samples,", pos_pos, "are positive for this analysis\n")
+  cat("=>", round(pos_pos / pos_total * 100, 1), "% of cancer-positive samples are positive\n")
+
+  # --- Future cancer for cancer-negative group ---
+  neg_samples <- positive_samples[positive_samples$cancer_status == "negative", ]
+  cat("\nTotal cancer-negative positive samples:", nrow(neg_samples), "\n")
+
+  months_numeric <- suppressWarnings(as.numeric(neg_samples$months_to_positive))
+  future_cancer <- neg_samples[!is.na(months_numeric), ]
+  future_cancer_within_12 <- neg_samples[!is.na(months_numeric) & months_numeric < 24, ]
+
+  cat("Cancer-negative samples with future cancer:", nrow(future_cancer), "\n")
+  cat("Cancer-negative samples with future cancer < 12 months:", nrow(future_cancer_within_12), "\n")
+  cat("Percentage with future cancer:",
+      round(nrow(future_cancer) / nrow(neg_samples) * 100, 1), "%\n")
+  cat("Percentage within 12 months:",
+      round(nrow(future_cancer_within_12) / nrow(neg_samples) * 100, 1), "%\n")
+
+  # --- Summary stats by source ---
+  cat("\nSummary statistics by source:\n")
+  by_source <- split(samples[[metric_col]], samples$source)
+  for (src in names(by_source)) {
+    vals <- by_source[[src]]
+    cat("Source:", src, "\n")
+    cat("  Mean:", round(mean(vals, na.rm = TRUE), 2), "\n")
+    cat("  Median:", round(median(vals, na.rm = TRUE), 2), "\n")
+    cat("  Mode:", round(get_mode(vals), 2), "\n")
+  }
+
+  # --- Summary stats by cancer_status ---
+  cat("\nSummary statistics by cancer_status:\n")
+  by_status <- split(samples[[metric_col]], samples$cancer_status)
+  for (status in names(by_status)) {
+    vals <- by_status[[status]]
+    cat("Cancer Status:", status, "\n")
+    cat("  Mean:", round(mean(vals, na.rm = TRUE), 2), "\n")
+    cat("  Median:", round(median(vals, na.rm = TRUE), 2), "\n")
+    cat("  Mode:", round(get_mode(vals), 2), "\n")
+  }
+}
+```
+
+
+```{r}
+# Apply your summarize function
+summarize_ctdna_metric(
+  data,                     # your full dataframe
+  "integrated_ctDNA_score",  # the metric to summarize
+  function(x) x >= 0.5,       # the threshold (adjust if you want)
+  "Integrated Cancer Score (cutoff = 0.5)"
+)
+```

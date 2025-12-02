@@ -1,0 +1,287 @@
+```{r}
+library(tidyverse)
+library(dplyr)
+library(matrixStats)
+library(reshape2)
+library(ggh4x)
+library(ggpubr)
+library(RColorBrewer)
+library(readxl)
+library(here)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+
+```{r}
+# outdir 
+outdir <- here::here("figures", "nucleosome_peaks")
+date <- Sys.Date();
+
+### Set paths
+path <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_nucleosome_peak_reshaped.csv")
+healthy_path <- here::here("data", "HBOC_pipeline_output", "control", "control_nucleosome_peak_reshaped.csv")
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+data_sum <- read.csv(path, check.names = FALSE)
+data_normal_sum <- read.csv(healthy_path, check.names = FALSE)
+metadata <- read_excel(metadata_path, sheet = "April22")
+
+# # remove failed samples
+metadata <- metadata[!grepl("CHARMQ_0788_Pl_T_PG_T-788", metadata$`Library Name`), ]
+metadata <- metadata[!grepl("CHARMQ_0207_Pl_T_PG_T-207", metadata$`Library Name`), ]
+
+
+# Adding ".downSample_peak_distance" to each value in the column
+data_sum <- data_sum[data_sum$Sample %in% metadata$'Library Name',]
+
+# Ensure the failed samples are removed
+data_sum <- data_sum[!grepl("CHARMQ_0788_Pl_T_PG_T-788", data_sum$Sample), ]
+data_sum <- data_sum[!grepl("CHARMQ_0207_Pl_T_PG_T-207", data_sum$Sample), ]
+```
+
+```{r}
+data_sum <- data_sum[, colnames(data_sum) %in% c("Sample", -300:300)]  
+data_sum[,2:ncol(data_sum)] <- data_sum[,2:ncol(data_sum)]/rowSums(data_sum[,2:ncol(data_sum)])*100
+
+data_normal_sum <- data_normal_sum[, colnames(data_normal_sum) %in% c("Sample", -300:300)]  
+data_normal_sum[,2:ncol(data_normal_sum)] <- data_normal_sum[,2:ncol(data_normal_sum)]/rowSums(data_normal_sum[,2:ncol(data_normal_sum)])*100
+
+### Calculate the healthy median
+normal_median <- colMedians(as.matrix(data_normal_sum[,2:ncol(data_normal_sum)]))
+normal_sd <- colSds(as.matrix(data_normal_sum[,2:ncol(data_normal_sum)]))
+
+### Calculate the cancer median
+
+# The list of cancer types
+cancer_types <- c("negative", "hgsoc", "liver", "endometrial", "thymoma", 
+                  "neuroendocrine", "peritoneal_papillary_serous_carcinoma", 
+                  "metastatic endometrial and ovarian ca")
+
+```
+
+
+
+```{r}
+## First modify metadata df
+#metadata_df$nucleosome_peak_Sampleid <- paste0(metadata_df$Sample_id, "_peak_distance", sep = "")
+
+library(matrixStats)
+
+# Initialize empty list to hold data frames for each cancer type
+list_of_data_frames <- list()
+
+cancer_types <- c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes")
+
+# Get zscore for each type
+for (cancer_type in cancer_types) {
+  
+  # Calculate median and standard deviation
+  type_median <- colMedians(as.matrix(
+    data_sum[data_sum$Sample %in%
+               metadata$`Library Name`[metadata$source == cancer_type],
+             2:ncol(data_sum)]))
+
+  type_sd <- colSds(as.matrix(
+    data_sum[data_sum$Sample %in%
+               metadata$`Library Name`[metadata$source == cancer_type],
+             2:ncol(data_sum)]))
+
+  # Calculate p-values
+  p_type <- ks.test(normal_median[210:390], type_median[210:390])$p.value
+
+  # Calculate z-scores
+  z_normal <- (normal_median - normal_median) / normal_sd
+  z_type <- (type_median - normal_median) / normal_sd
+
+  type_dif <- type_median - normal_median
+
+  # Make a data frame for this cancer type and add it to the list
+  temp_df <- data.frame(
+    length = c(-300:300),
+    score = z_type,
+    cancer_status = cancer_type
+  )
+  list_of_data_frames[[cancer_type]] <- temp_df
+}
+```
+
+```{r}
+# ###### error ############ 
+# 
+# Combine all data frames into one
+data_plot <- do.call(rbind, list_of_data_frames)
+
+
+## Now melt
+### Make plotting table (individuals)
+data_melt <- reshape2::melt(data_sum, id = "Sample")
+data_melt$variable <- as.numeric(as.character(data_melt$variable))
+data_melt$diag <- "Cancer"
+data_melt <- merge(data_melt, metadata, by.x = "Sample", by.y = "Library Name")
+
+### Make plotting table (difference to healthy)
+list_of_data_frames <- list()
+
+# Initialize list to hold p-values
+p_values_list <- list()
+
+# Get diff and p-value for each type
+for (cancer_type in cancer_types) {
+
+  # Calculate median and standard deviation
+  type_median <- colMedians(as.matrix(
+    data_sum[data_sum$Sample %in%
+               metadata$`Library Name`[metadata$source == cancer_type],
+             2:ncol(data_sum)]))
+
+  type_sd <- colSds(as.matrix(
+    data_sum[data_sum$Sample %in%
+               metadata$`Library Name`[metadata$source == cancer_type],
+             2:ncol(data_sum)]))
+
+  # Calculate p-values
+  p_type <- ks.test(normal_median[210:390], type_median[210:390])$p.value
+
+  # Store p-value in the list
+  p_values_list[[cancer_type]] <- round(p_type, 7)
+
+  # Calculate z-scores
+  z_type <- (type_median - normal_median) / normal_sd
+
+  # Calculate the difference from normal_median
+  type_dif <- type_median - normal_median
+
+  # Make a data frame for this cancer type and add it to the list
+  temp_df <- data.frame(
+    length = c(-300:300),
+    score = type_dif,
+    cancer_status = cancer_type
+  )
+  list_of_data_frames[[cancer_type]] <- temp_df
+}
+
+```
+
+```{r}
+data_diff <- do.call(rbind, list_of_data_frames)
+
+### Merge plots
+data_melt <- data_melt[, c("Sample", "variable", "value", "source")]
+colnames(data_melt) <- c("Sample", "length", "score", "cancer_status")
+data_melt$analysis <- "Frequency"
+
+data_plot$Sample <- data_plot$cancer_status
+data_plot$analysis <- "Z-score"
+
+data_diff$Sample <- data_diff$cancer_status
+data_diff$analysis <- "Difference"
+
+data_plot <- bind_rows(data_plot, data_melt, data_diff)
+data_plot$analysis <- factor(data_plot$analysis, levels = c("Frequency", "Z-score", "Difference"))
+data_plot$cancer_status <- factor(data_plot$cancer_status, levels = c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes"))
+
+
+### Set hlines
+data_lines <- data.frame(cancer_status = rep(c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes"), 2),
+                         analysis = c(rep("Difference", 4), rep("Z-score", 4)),
+                         line = c(rep(0, 8)))
+data_lines$analysis <- factor(data_lines$analysis, levels = c("Frequency", "Z-score", "Difference"))
+data_lines$cancer_status <- factor(data_lines$cancer_status, levels = c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes"))
+data_median <- data.frame(length = c(-300:300),
+                          median = normal_median,
+                          analysis = "Frequency")
+data_median$analysis <- factor(data_median$analysis, levels = c("Frequency", "Z-score", "Difference"))
+
+```
+
+```{r}
+### Set p-value
+# Create a data frame for p-values
+data_pvalue <- data.frame(
+  cancer_status = names(p_values_list),
+  analysis = rep("Difference", length(p_values_list)),
+  value = unlist(p_values_list)
+)
+data_pvalue$cancer_status <- factor(data_pvalue$cancer_status, levels = c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes"))
+data_pvalue$analysis <- factor(data_pvalue$analysis, levels = c("Frequency", "Z-score", "Difference"))
+
+### Set theme
+theme <- theme_minimal(base_size = 16) +
+  theme(
+    # Plot title
+    plot.title        = element_text(size = 22, face = "bold", hjust = 0.5, margin = margin(b = 15)),
+
+    # Facet strips (analysis rows and cancer_status columns)
+    strip.text.x      = element_text(size = 15),  # cancer_status
+    strip.text.y      = element_text(size = 15),  # analysis
+
+    # Axis titles
+    axis.title.x      = element_text(size = 18, face = "bold"),
+    axis.title.y      = element_blank(),                         # you had y lab blank
+
+    # Axis tick labels
+    axis.text.x       = element_text(size = 14, angle = 0, vjust = 1, margin = margin(t = 5)),
+    axis.text.y       = element_text(size = 14, face = "bold"),
+
+    # Axis lines and ticks
+    axis.line         = element_line(color = "black", size = 0.8),
+    axis.ticks.x      = element_line(color = "black", size = 0.8),
+    axis.ticks.y      = element_line(color = "black", size = 0.8),
+
+    # Remove grids
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    panel.background  = element_blank(),
+    panel.border      = element_rect(fill = NA, color = NA),
+
+    # Legend (you have none)
+    legend.position   = "none",
+
+    # Spacing
+    panel.spacing     = unit(0.5, "lines"),
+    plot.margin       = margin(10, 15, 10, 10, unit = "mm")
+  )
+
+### Plot curves
+
+## Get colors 
+labs <- c("first_positive_survivor_no" = "Cancer Positive \n(First Positive)", "cancer_status_negative_survivor_no" = "Cancer Negative \n(Survivor No)", "cancer_status_negative_survivor_yes"= "Cancer Negative \n(Survivor Yes)", "cancer_status_positive_survivor_yes"= "Cancer Positive \n(Survivor Yes)", "Frequency" = "Frequency", "Z-score" = "Z-score", "Difference" = "Difference")
+
+```
+
+```{r}
+
+# define exactly the colors you showed in your legend
+col_cancer_type <- c(
+  first_positive_survivor_no          = "#f87544",
+  cancer_status_positive_survivor_yes = "#f4c842",
+  cancer_status_negative_survivor_no  = "#9467bd",
+  cancer_status_negative_survivor_yes = "#1f77b4"
+  # you can add Healthy/HBC here if you ever plot it:
+  # , HBC = "#B2DF8A"
+)
+
+## Plot curve 
+data_plot_filtered <- data_plot %>% dplyr::filter(!is.na(cancer_status))
+fig <- ggplot(data_plot_filtered) +
+  geom_line(aes(length, score, color = cancer_status, group = Sample), linewidth = 0.5, alpha = 0.5) +
+  geom_line(data = data_median, aes(length, median), linewidth = 0.5) +
+  geom_text(data = data_pvalue, aes(-150, -0.003, label = paste0("p-value\n", value)), size = 4, vjust = 1) +
+  geom_hline(data = data_lines, aes(yintercept = line), linetype = "dashed", size = 0.5) +
+  geom_vline(xintercept = c(-83, 83), linetype = "dashed", size = 0.5) +
+  xlab("Distance") + 
+  ylab("") +
+  labs(color = "") +
+  facet_grid(analysis~cancer_status, scales = "free_y", labeller = as_labeller(labs)) +
+  ggtitle(paste0("Distance to Nearest Peak")) + 
+  scale_color_manual(values = col_cancer_type) +
+  theme
+fig
+
+ggsave(file.path(outdir, paste0("01_figure_nucleosome_peaks_cancer_groups.pdf")), fig, width = 11.5, height = 8.5, units = "in", dpi = 500)
+```
+

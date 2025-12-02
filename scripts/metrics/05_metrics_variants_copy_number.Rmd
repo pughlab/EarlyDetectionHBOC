@@ -1,0 +1,604 @@
+---
+title: "05_processing_metrics_variants_copy_number"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(tidyr)
+library(here)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+
+# Define output directory
+outdir <- here::here("figures", "statistics")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+# Read in data
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores <- read.csv(scores_path, header = TRUE, check.names = FALSE)
+
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header = TRUE, check.names = FALSE)
+
+# Load sample metadata
+samples <- readxl::read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"),sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+
+# Load oncoplot data
+oncoplot <- readxl::read_excel(here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+
+# Prepare germline oncoplot data
+oncoplot_germline <- oncoplot[, c("group_id", "analysis_type")]
+oncoplot_germline <- merge(samples, oncoplot_germline, by = "group_id", all.y = TRUE)
+oncoplot_germline <- oncoplot_germline[, c("LIB_ID", "group_id", "TS", "analysis_type")]
+
+# Filter out specific samples
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+```
+
+```{r}
+
+oncoplot[oncoplot == "not_sequenced"] <- ""
+
+# Define somatic mutation columns
+somatic_cols <- c("BRCA1_somatic", "BRCA2_somatic", "TP53", "PMS2", "EPCAM", 
+                  "PALB2", "MLH1", "MSH2", "MSH6", "ATM", "ATR")
+
+# Create a column listing all mutated genes per row
+oncoplot$Mutation_gene <- apply(oncoplot[, somatic_cols], 1, function(row) {
+  mutated_genes <- somatic_cols[!is.na(row) & row != "" & row != "NA"]
+  if (length(mutated_genes) == 0) "" else paste(mutated_genes, collapse = "; ")
+})
+
+# Subset to group_id and Mutation
+mutation_status <- oncoplot[, c("group_id", "Mutation_gene")]
+```
+
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("group_id", "Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive")]
+```
+
+```{r}
+data <- merge(samples, scores, by.x = c("group_id", "Library Name", "TS"), by.y = c("group_id", "Library Name", "TS"), all.y = TRUE)
+data <- data %>% dplyr::select(group_id, LIB_ID, `Library Name`, TS, everything())
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+data$TS[data$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+data$TS[data$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+data$TS[data$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+data$TS[data$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+# remove 2 CHARMQ samples that we couldn't verify germline mutation
+data <- data[!grepl("T-788-T0", data$group_id), ]
+data <- data[!grepl("T-207-T0", data$group_id), ]
+
+# remove cfMeDIP samples 
+data <- data[!grepl("LIB-04-0649-T0", data$group_id), ]
+data <- data[!grepl("LIB-04-0441-T1", data$group_id), ]
+data <- data[!grepl("LIB-04-0024-T2", data$group_id), ]
+data <- data[!grepl("LIB-04-0131-T0", data$group_id), ]
+```
+
+```{r}
+# # Merge mutation info into `data`
+data <- merge(data, mutation_status, by = "group_id", all.x = TRUE)
+
+# Fill NAs with "" (no mutation)
+data$Mutation_gene[is.na(data$Mutation_gene)] <- ""
+
+```
+
+```{r}
+tumour_fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+```
+
+# Germline Analysis
+```{r}
+table_ <- aggregate(LIB_ID ~ analysis_type, data=oncoplot_germline, FUN=function(x) length(unique(x)))
+colnames(table_)[2] <- "n_patients"
+print(table_)
+```
+
+```{r}
+table_ <- aggregate(group_id ~ analysis_type, data=oncoplot_germline, FUN=function(x) length(unique(x)))
+colnames(table_)[2] <- "n_samples"
+print(table_)
+```
+
+```{r}
+subset1 <- subset(oncoplot_germline, analysis_type == "TS_plasma_but_needed_manual")
+subset2 <- subset(oncoplot_germline, analysis_type == "HaplotypeCaller_on_WGS_plasma_and_buffy")
+
+subset3 <- subset(oncoplot_germline, analysis_type == "CNMops")
+
+cat("CNMops_but_needed_manual samples:\n")
+print(unique(subset1$group_id))
+cat("Number of unique patients (LIB_ID):\n")
+print(length(unique(subset1$LIB_ID)))
+
+cat("\nHaplotypeCaller_on_WGS_plasma_and_buffy samples:\n")
+print(unique(subset2$group_id))
+cat("Number of unique patients (LIB_ID):\n")
+print(length(unique(subset2$LIB_ID)))
+
+cat("\nFound through CNMops:\n")
+print(unique(subset3$group_id))
+cat("Number of unique patients (LIB_ID):\n")
+print(length(unique(subset3$LIB_ID)))
+```
+#Mutation information by cancer_status
+```{r}
+# 1. Define valid samples
+valid_samples <- data %>%
+  dplyr::filter(!is.na(TS) & TS != "")
+
+# Number of samples and patients where TS is available
+n_ts_samples <- nrow(valid_samples)
+n_ts_patients <- length(unique(valid_samples$LIB_ID))
+
+cat("\nSamples with TS available:\n")
+cat("- Number of samples:", n_ts_samples, "\n")
+cat("- Number of unique patients:", n_ts_patients, "\n")
+
+# 2. Valid samples per cancer_status
+valid_per_status <- valid_samples %>%
+  group_by(cancer_status) %>%
+  dplyr::summarise(n_valid = n(), .groups = "drop")
+
+# 3. Mutation-positive samples
+mutation_samples <- data %>%
+  dplyr::filter(!is.na(Mutation_gene) & Mutation_gene != "")
+
+# 4. Long-format mutation by gene
+mutation_long <- mutation_samples %>%
+  mutate(Mutation_gene = as.character(Mutation_gene)) %>%
+  mutate(gene = strsplit(Mutation_gene, ";\\s*")) %>%
+  unnest(gene)
+
+# 5. Gene counts per group (using cancer_status)
+per_gene <- mutation_long %>%
+  group_by(cancer_status, gene) %>%
+  dplyr::summarise(gene_mutations = n(), .groups = "drop") %>%
+  pivot_wider(names_from = gene, values_from = gene_mutations, values_fill = 0)
+
+# 6. Sample and patient counts per group
+totals <- mutation_samples %>%
+  group_by(cancer_status) %>%
+  dplyr::summarise(
+    num_samples = n(),
+    num_patients = n_distinct(LIB_ID),
+    .groups = "drop"
+  )
+
+# 7. Merge and calculate detection rate
+detection_rates <- totals %>%
+  left_join(valid_per_status, by = "cancer_status") %>%
+  mutate(detection_rate = round(num_samples / n_valid * 100, 1))
+
+# 8. Cancer-negative patients with somatic mutations
+mutation_neg <- mutation_samples %>%
+  dplyr::filter(cancer_status == "negative")
+
+# 9. Convert months_to_positive safely
+mutation_neg <- mutation_neg %>%
+  mutate(months_to_positive_numeric = suppressWarnings(as.numeric(months_to_positive)))
+
+# 10. Categorize follow-up time
+mutation_neg <- mutation_neg %>%
+  mutate(followup_bucket = case_when(
+    is.na(months_to_positive_numeric) ~ "no follow-up",
+    months_to_positive_numeric < 12 ~ "<12 months",
+    months_to_positive_numeric < 24 ~ "12–24 months",
+    TRUE ~ ">24 months"
+  ))
+
+# 11. Summarize group-wise mutation info
+print(detection_rates)
+print(per_gene)
+
+# 12. Summarize follow-up categories
+followup_summary <- mutation_neg %>%
+  group_by(followup_bucket) %>%
+  dplyr::summarise(
+    n_patients = n_distinct(LIB_ID),
+    group_ids = list(unique(group_id)),
+    .groups = "drop"
+  )
+```
+
+
+# Mutation information by source
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. Define valid samples
+valid_samples <- data %>%
+  dplyr::filter(!is.na(TS) & TS != "")
+
+# Number of samples and patients where TS is available
+n_ts_samples <- nrow(valid_samples)
+n_ts_patients <- length(unique(valid_samples$LIB_ID))
+
+cat("\nSamples with TS available:\n")
+cat("- Number of samples:", n_ts_samples, "\n")
+cat("- Number of unique patients:", n_ts_patients, "\n")
+
+# 2. Valid samples per cancer_status
+valid_per_status <- valid_samples %>%
+  group_by(source) %>%
+  dplyr::summarise(n_valid = n(), .groups = "drop")
+
+# 3. Mutation-positive samples
+mutation_samples <- data %>%
+  dplyr::filter(!is.na(Mutation_gene) & Mutation_gene != "")
+
+# 4. Long-format mutation by gene
+mutation_long <- mutation_samples %>%
+  mutate(Mutation_gene = as.character(Mutation_gene)) %>%
+  mutate(gene = strsplit(Mutation_gene, ";\\s*")) %>%
+  unnest(gene)
+
+# 5. Gene counts per group (using `source`, which includes cancer status)
+per_gene <- mutation_long %>%
+  group_by(source, gene) %>%
+  dplyr::summarise(gene_mutations = n(), .groups = "drop") %>%
+  pivot_wider(names_from = gene, values_from = gene_mutations, values_fill = 0)
+
+# 6. Sample and patient counts per group
+totals <- mutation_samples %>%
+  group_by(source) %>%
+  dplyr::summarise(
+    num_samples = n(),
+    num_patients = n_distinct(LIB_ID),
+    .groups = "drop"
+  )
+
+# 7. Merge and calculate detection rate
+detection_rates <- totals %>%
+  left_join(valid_per_status, by = "source") %>%
+  mutate(detection_rate = round(num_samples / n_valid * 100, 1))
+
+# 8. Cancer-negative patients with somatic mutations
+mutation_neg <- mutation_samples %>%
+  dplyr::filter(grepl("negative", source))
+
+# 9. Convert months_to_positive safely
+mutation_neg <- mutation_neg %>%
+  mutate(months_to_positive_numeric = suppressWarnings(as.numeric(months_to_positive)))
+
+# 10. Categorize follow-up time
+mutation_neg <- mutation_neg %>%
+  dplyr::mutate(followup_bucket = case_when(
+    is.na(months_to_positive_numeric) ~ "no follow-up",
+    months_to_positive_numeric < 12 ~ "<12 months",
+    months_to_positive_numeric < 24 ~ "12–24 months",
+    TRUE ~ ">24 months"
+  ))
+
+# 11. Summarize group-wise mutation info (source/cancer_status)
+print(detection_rates)
+print(per_gene)
+
+# 12. Summarize follow-up categories
+followup_summary <- mutation_neg %>%
+  group_by(followup_bucket) %>%
+  dplyr::summarise(
+    n_patients = n_distinct(LIB_ID),
+    group_ids = list(unique(group_id)),
+    .groups = "drop"
+  )
+
+n_total_neg_patients <- length(unique(mutation_neg$LIB_ID))
+
+cat("\nAmong cancer-negative patients with somatic mutations:\n")
+cat("- Total unique patients:", n_total_neg_patients, "\n\n")
+
+for (i in seq_len(nrow(followup_summary))) {
+  bucket <- followup_summary$followup_bucket[i]
+  count <- followup_summary$n_patients[i]
+  ids <- followup_summary$group_ids[[i]]
+  
+  cat("•", bucket, ":", count, "patient(s)\n")
+  print(ids)
+}
+```
+
+## Tumour Fraction above 99th percentile 
+```{r}
+# 1. Define WGS-valid samples (Library Name present)
+wgs_valid_samples <- data %>%
+  dplyr::filter(!is.na(`Library Name`) & `Library Name` != "")
+
+# 2. Count total WGS-valid samples and patients
+n_wgs_samples <- nrow(wgs_valid_samples)
+n_wgs_patients <- length(unique(wgs_valid_samples$LIB_ID))
+
+cat("\nWGS-valid samples:\n")
+cat("- Number of samples:", n_wgs_samples, "\n")
+cat("- Number of unique patients:", n_wgs_patients, "\n")
+
+# 3. Filter high tumour fraction samples
+high_tf_samples <- wgs_valid_samples %>%
+  dplyr::filter(Tumour.Fraction > tumour_fraction_cutoff)
+
+n_tf_samples <- nrow(high_tf_samples)
+n_tf_patients <- length(unique(high_tf_samples$LIB_ID))
+
+cat("\nHigh TF samples (TF > cutoff = ", round(tumour_fraction_cutoff, 4), "):\n", sep = "")
+cat("- Number of samples:", n_tf_samples, "\n")
+cat("- Number of unique patients:", n_tf_patients, "\n")
+
+# 4. High TF by cancer_status and source
+cat("\nTumour Fraction > cutoff by cancer_status:\n")
+print(table(high_tf_samples$cancer_status))
+cat("Percentages:\n")
+print(round(prop.table(table(high_tf_samples$cancer_status)) * 100, 1))
+
+cat("\nTumour Fraction > cutoff by source:\n")
+print(table(high_tf_samples$source))
+cat("Percentages:\n")
+print(round(prop.table(table(high_tf_samples$source)) * 100, 1))
+
+# 5. Detection rate (use WGS-valid as denominator)
+# Count WGS-valid per group
+wgs_counts <- wgs_valid_samples %>%
+  group_by(source, cancer_status) %>%
+  dplyr::summarise(n_wgs = n(), .groups = "drop")
+
+# Count high TF per group
+high_tf_counts <- high_tf_samples %>%
+  group_by(source, cancer_status) %>%
+  dplyr::summarise(n_high_tf = n(), n_patients = n_distinct(LIB_ID), .groups = "drop")
+
+# Merge and calculate detection rate
+tf_detection <- left_join(high_tf_counts, wgs_counts, by = c("source", "cancer_status")) %>%
+  mutate(detection_rate = round(n_high_tf / n_wgs * 100, 1)) %>%
+  arrange(desc(detection_rate))
+
+cat("\nTumour Fraction detection summary (WGS-valid denominator):\n")
+print(tf_detection)
+
+# 6. Categorize months_to_positive
+high_tf_samples <- high_tf_samples %>%
+  mutate(months_to_positive_numeric = suppressWarnings(as.numeric(months_to_positive)),
+         followup_bucket = case_when(
+           is.na(months_to_positive_numeric) ~ "no follow-up",
+           months_to_positive_numeric < 12 ~ "<12 months",
+           months_to_positive_numeric < 24 ~ "12–24 months",
+           TRUE ~ ">24 months"
+         ))
+
+# 7. Overall follow-up summary
+followup_summary <- high_tf_samples %>%
+  group_by(followup_bucket) %>%
+  dplyr::summarise(
+    n_samples = n(),
+    n_patients = n_distinct(LIB_ID),
+    group_ids = list(unique(group_id)),
+    .groups = "drop"
+  )
+
+cat("\nHigh TF samples by months_to_positive:\n")
+for (i in seq_len(nrow(followup_summary))) {
+  bucket <- followup_summary$followup_bucket[i]
+  count <- followup_summary$n_samples[i]
+  patients <- followup_summary$n_patients[i]
+  ids <- followup_summary$group_ids[[i]]
+  
+  cat("•", bucket, ":", count, "samples from", patients, "patients\n")
+  print(ids)
+}
+
+# 8. Cancer-negative high TF samples follow-up
+high_tf_neg <- high_tf_samples %>%
+  dplyr::filter(cancer_status == "negative")
+
+followup_neg_summary <- high_tf_neg %>%
+  group_by(followup_bucket) %>%
+  dplyr::summarise(
+    n_samples = n(),
+    n_patients = n_distinct(LIB_ID),
+    group_ids = list(unique(group_id)),
+    .groups = "drop"
+  )
+
+cat("\nCancer-negative high TF samples by months_to_positive:\n")
+for (i in seq_len(nrow(followup_neg_summary))) {
+  bucket <- followup_neg_summary$followup_bucket[i]
+  count <- followup_neg_summary$n_samples[i]
+  patients <- followup_neg_summary$n_patients[i]
+  ids <- followup_neg_summary$group_ids[[i]]
+  
+  cat("•", bucket, ":", count, "samples from", patients, "patients\n")
+  print(ids)
+}
+```
+
+### Mutation and Tumour Fraction Integrated. 
+```{r}
+# 1. Samples with both TS and WGS
+both_data <- data %>%
+  dplyr::filter(!is.na(TS), TS != "", !is.na(`Library Name`), `Library Name` != "")
+
+n_both_samples <- nrow(both_data)
+n_both_patients <- length(unique(both_data$LIB_ID))
+
+cat("Samples with both TS and WGS:\n")
+cat("- Total samples:", n_both_samples, "\n")
+cat("- Total unique patients:", n_both_patients, "\n\n")
+
+# 2. Breakdown by source
+source_breakdown <- both_data %>%
+  group_by(source) %>%
+  dplyr::summarise(
+    n_samples = n(),
+    n_patients = n_distinct(LIB_ID),
+    .groups = "drop"
+  )
+
+cat("Breakdown by source:\n")
+print(source_breakdown)
+
+# 3. Detection logic (exclusive classification, force character)
+both_detected <- both_data %>%
+  mutate(
+    has_mutation = !is.na(Mutation_gene) & Mutation_gene != "",
+    high_tf = Tumour.Fraction > tumour_fraction_cutoff
+  ) %>%
+  mutate(
+    detection_category = case_when(
+      has_mutation & high_tf ~ "both",
+      has_mutation ~ "mutation_only",
+      high_tf ~ "high_tf_only",
+      TRUE ~ "none"
+    ) %>% as.character()
+  )
+
+# 4. Detection category counts
+cat("\nDetection category summary (samples):\n")
+detection_summary <- both_detected %>%
+  group_by(detection_category) %>%
+  dplyr::summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = detection_category, values_from = n, values_fill = 0)
+print(detection_summary)
+
+# 5. Total detection stats
+n_detected_samples <- sum(both_detected$detection_category != "none")
+n_detected_patients <- length(unique(both_detected$LIB_ID[both_detected$detection_category != "none"]))
+
+cat("\nSamples with mutation and/or high TF:\n")
+cat("- Detected samples:", n_detected_samples, "\n")
+cat("- Unique patients with detection:", n_detected_patients, "\n")
+cat("- Detection rate (samples):", round(n_detected_samples / n_both_samples * 100, 1), "%\n")
+cat("- Detection rate (patients):", round(n_detected_patients / n_both_patients * 100, 1), "%\n")
+
+# 6. Detection summary by source
+summarize_detection <- function(df, group_var) {
+  df %>%
+    group_by({{ group_var }}, detection_category) %>%
+    dplyr::summarise(n = n(), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = detection_category, values_from = n, values_fill = 0) %>%
+    left_join(
+      df %>%
+        group_by({{ group_var }}) %>%
+        dplyr::summarise(
+          n_samples = n(),
+          n_patients = n_distinct(LIB_ID),
+          n_detected_patients = n_distinct(LIB_ID[detection_category != "none"]),
+          .groups = "drop"
+        ),
+      by = rlang::as_name(rlang::ensym(group_var))
+    ) %>%
+    mutate(
+      detection_rate_samples = round((coalesce(mutation_only, 0) +
+                                      coalesce(high_tf_only, 0) +
+                                      coalesce(both, 0)) / n_samples * 100, 1),
+      detection_rate_patients = round(n_detected_patients / n_patients * 100, 1)
+    )
+}
+
+# --- Apply for source ---
+cat("\nDetection summary by source:\n")
+detection_by_source <- summarize_detection(both_detected, source)
+print(detection_by_source)
+
+# --- Apply for cancer_status ---
+cat("\nDetection summary by cancer_status:\n")
+detection_by_status <- summarize_detection(both_detected, cancer_status)
+print(detection_by_status)
+```
+
+```{r}
+# Cancer-negative samples with mutation signal (mutation_only or both)
+mutation_signal <- both_detected %>%
+  dplyr::filter(
+    source %in% c("cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes"),
+    detection_category %in% c("mutation_only", "both")
+  ) %>%
+  dplyr::mutate(months_to_positive_num = suppressWarnings(as.numeric(months_to_positive))) %>%
+  dplyr::filter(!is.na(months_to_positive_num))
+
+# Calculate stats
+n_mutation <- nrow(mutation_signal)
+max_mtp_mut <- max(mutation_signal$months_to_positive_num, na.rm = TRUE)
+mean_mtp_mut <- mean(mutation_signal$months_to_positive_num, na.rm = TRUE)
+median_mtp_mut <- median(mutation_signal$months_to_positive_num, na.rm = TRUE)
+within_12_mut <- sum(mutation_signal$months_to_positive_num <= 12)
+
+# Output
+cat("\nCancer-negative samples with mutation signal that later developed cancer:\n")
+cat("- Number of samples:", n_mutation, "\n")
+cat("- Max months to positive:", max_mtp_mut, "\n")
+cat("- Mean months to positive:", round(mean_mtp_mut, 1), "\n")
+cat("- Median months to positive:", median_mtp_mut, "\n")
+cat("- Developed cancer within 12 months:", within_12_mut, "\n")
+```
+
+
+```{r}
+# 7. Cancer-negative samples with detection signal that later developed cancer
+negatives_with_signal_later_cancer <- both_detected %>%
+  dplyr::filter(
+    source %in% c("cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes"),
+    detection_category != "none"
+  ) %>%
+  dplyr::mutate(months_to_positive_num = suppressWarnings(as.numeric(months_to_positive))) %>%
+  dplyr::filter(!is.na(months_to_positive_num))
+
+# Compute statistics
+max_mtp <- max(negatives_with_signal_later_cancer$months_to_positive_num, na.rm = TRUE)
+mean_mtp <- mean(negatives_with_signal_later_cancer$months_to_positive_num, na.rm = TRUE)
+median_mtp <- median(negatives_with_signal_later_cancer$months_to_positive_num, na.rm = TRUE)
+n_with_mtp <- nrow(negatives_with_signal_later_cancer)
+
+# Count how many developed cancer within 12 months
+within_12_months <- negatives_with_signal_later_cancer %>%
+  dplyr::filter(months_to_positive_num <= 12) %>%
+  nrow()
+
+cat("\nCancer-negative samples with mutation and/or high TF that later developed cancer:\n")
+cat("- Number of samples:", n_with_mtp, "\n")
+cat("- Max months to positive:", max_mtp, "\n")
+cat("- Mean months to positive:", round(mean_mtp, 1), "\n")
+cat("- Median months to positive:", median_mtp, "\n")
+cat("- Developed cancer within 12 months:", within_12_months, "\n")
+```

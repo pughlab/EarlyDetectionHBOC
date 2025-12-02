@@ -1,0 +1,144 @@
+---
+title: "02_cfMeDIP_statistics"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("figures", "cfMeDIP")
+outdir_data <- here::here("data", "cfMeDIP")
+
+# read in data 
+scores_path <- here::here("data", "cfMeDIP", "01_processing_cfMeDIP_combined_genomics_methylation.csv") 
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+scores <- scores[
+  !(
+    is.na(scores$`Library Name`) | scores$`Library Name` == "" | scores$`Library Name` == "NS" |
+    is.na(scores$TS) | scores$TS == "" | scores$TS == "NS" |
+    is.na(scores$cfMeDIP) | scores$cfMeDIP == "" | scores$cfMeDIP == "NS"
+  ),
+]
+```
+
+```{r}
+integrated_ctDNA_score_cutoff <- 0.5 
+
+# 99 percentile
+HBOC_breast_cutoff <-  0.0506
+HBOC_ovarian_cutoff <- 0.155
+```
+
+```{r}
+scores$HBOC_breast <- ifelse(scores$HBOC_breast >= HBOC_breast_cutoff, "pos", "neg")
+scores$HBOC_breast[is.na(scores$`cfMeDIP`) | scores$`cfMeDIP` == "" | scores$months_to_positive %in% c("UNK", "pending")] <- "NS"
+
+scores$HBOC_ovarian <- ifelse(scores$HBOC_ovarian >= HBOC_ovarian_cutoff, "pos", "neg")
+scores$HBOC_ovarian[is.na(scores$`cfMeDIP`) | scores$`cfMeDIP` == "" | scores$months_to_positive %in% c("UNK", "pending")] <- "NS"
+
+scores$integrated_ctDNA_score <- ifelse(scores$integrated_ctDNA_score >= integrated_ctDNA_score_cutoff, "pos", "neg")
+scores$integrated_ctDNA_score[
+  is.na(scores$`Library Name`) | scores$`Library Name` == "" |
+  is.na(scores$TS) | scores$TS == "" |
+  scores$months_to_positive %in% c("UNK", "pending")
+] <- "NS"
+
+```
+
+```{r}
+compute_confusion_metrics <- function(df, prediction_col, cancer_type_match) {
+  # Ensure required columns are present
+  if (!all(c(prediction_col, "cancer_status", "cancer_type") %in% colnames(df))) {
+    stop("Missing required columns in the dataframe.")
+  }
+  
+  # Subset to valid predictions (i.e. not "NS")
+  df <- df[ 
+  !is.na(df[[prediction_col]]) &       # remove the NA rows
+    df[[prediction_col]] != "NS",      # remove the "NS" rows
+  ]
+  
+  # Define TP, FP, TN, FN
+  TP <- sum(df[[prediction_col]] == "pos" &
+              df$cancer_status == "positive" &
+              df$cancer_type == cancer_type_match)
+  
+  FP <- sum(df[[prediction_col]] == "pos" &
+              ((df$cancer_status == "negative") |
+               (df$cancer_status == "positive" & df$cancer_type != cancer_type_match)))
+  
+  TN <- sum(df[[prediction_col]] == "neg" &
+              ((df$cancer_status == "negative") |
+               (df$cancer_status == "positive" & df$cancer_type != cancer_type_match)))
+  
+  FN <- sum(df[[prediction_col]] == "neg" &
+              df$cancer_status == "positive" &
+              df$cancer_type == cancer_type_match)
+  
+  # Compute metrics safely
+  sensitivity <- if ((TP + FN) > 0) TP / (TP + FN) else NA
+  specificity <- if ((TN + FP) > 0) TN / (TN + FP) else NA
+  PPV        <- if ((TP + FP) > 0) TP / (TP + FP) else NA
+  NPV        <- if ((TN + FN) > 0) TN / (TN + FN) else NA
+  
+  # Output
+  cat("\nConfusion matrix for:", prediction_col, "(target:", cancer_type_match, ")\n")
+  cat("TP:", TP, "FP:", FP, "TN:", TN, "FN:", FN, "\n")
+  cat("Sensitivity:", round(sensitivity, 3), "\n")
+  cat("Specificity:", round(specificity, 3), "\n")
+  cat("PPV:", round(PPV, 3), "\n")
+  cat("NPV:", round(NPV, 3), "\n\n")
+  
+  # Optionally return values
+  return(invisible(list(TP=TP, FP=FP, TN=TN, FN=FN,
+                        Sensitivity=sensitivity,
+                        Specificity=specificity,
+                        PPV=PPV,
+                        NPV=NPV)))
+}
+```
+
+```{r}
+scores %>% 
+  dplyr::filter(is.na(.data[["HBOC_breast"]])) %>% 
+  { 
+    cat("\nRows where", "HBOC_breast", "is NA:\n"); 
+    print(.); 
+  }
+```
+
+```{r}
+compute_confusion_metrics(scores, "HBOC_breast", "breast")
+
+scores_intpos <- scores[scores$integrated_ctDNA_score == "pos" & !is.na(scores$integrated_ctDNA_score), ]
+
+cat("Focusing on integrated positive samples")
+compute_confusion_metrics(scores_intpos, "HBOC_breast", "breast")
+```
+
+```{r}
+compute_confusion_metrics(scores, "HBOC_ovarian", "ovarian")
+
+scores_intpos <- scores[scores$integrated_ctDNA_score == "pos" & !is.na(scores$integrated_ctDNA_score), ]
+
+cat("Focusing on integrated positive samples")
+compute_confusion_metrics(scores_intpos, "HBOC_ovarian", "ovarian")
+```

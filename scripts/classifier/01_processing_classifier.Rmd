@@ -1,0 +1,410 @@
+---
+title: "01_processing_classifier"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(pROC)
+library(pracma)
+library(caret)
+library(ggplot2)
+library(gbm)
+library(scales)  
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+
+```
+
+```{r}
+# Create timestamp with date and time
+timestamp <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+
+# Define output directories with timestamp appended
+outdir_figures <- here::here("figures", "classifier", paste0("model_", timestamp))
+outdir_data <- here::here("data", "classifier", paste0("model_", timestamp))
+outdir_data_model <- here::here("data", "classifier", paste0("model_", timestamp))
+
+# Create directories if they do not exist
+if (!dir.exists(outdir_figures)) dir.create(outdir_figures, recursive = TRUE)
+if (!dir.exists(outdir_data)) dir.create(outdir_data, recursive = TRUE)
+if (!dir.exists(outdir_data_model)) dir.create(outdir_data_model, recursive = TRUE)
+# Source helper functions
+source(here::here("scripts", "classifier", "02_classifier_helper_functions.R"))
+
+# Check function exists
+stopifnot(exists("run_ml_pipeline_repeated"))
+```
+
+```{r}
+# read in data see
+scores_path <- here::here("data", "statistics", "01_statistics_HBOC_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+scores <- scores[!grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", scores$TS),]
+scores <- scores[!grepl("T-788-T0", scores$group_id), ]
+scores <- scores[!grepl("T-207-T0", scores$group_id), ]
+scores <- scores[!(is.na(scores$TS) | scores$TS == "" | is.na(scores$`Library Name`) | scores$`Library Name` == ""), ]
+scores <- scores[!scores$group_id %in% c("LIB-04-0154-T0", "LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0664-T0"), ]
+scores$Mutation <- ifelse(!is.na(scores$Mutation) & scores$Mutation != "", 1, 0)
+
+control_scores_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+control_scores <- read.csv(control_scores_path, header=TRUE, check.names=FALSE)
+# assuming control scores are all 0. 
+control_scores$Mutation <- 0
+control_scores$mutation_vaf <- 0
+
+# read in data for the negative vs. negative. 
+scores_path <- here::here("data", "metrics", "01_metrics_integrated_cleaned.csv")
+valid_samples <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(samples_path, sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", samples$TS), ]
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+samples <- samples[!(is.na(samples$TS) | samples$TS == "" | is.na(samples$`Library Name`) | samples$`Library Name` == ""), ]
+
+# remove samples without TS. 
+samples <- samples[!samples$TS %in% c("LIB-04-0154-T0", "LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0664-T0"), ]
+```
+
+# add the mutation vafs. 
+```{r}
+mutation_vafs <- read_excel(here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+mutation_vafs <- mutation_vafs[, c("group_id", "vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "vaf_TP53", "vaf_PALB2")]
+
+mutation_vafs$mutation_vaf <- apply(mutation_vafs[, c("vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "vaf_TP53", "vaf_PALB2")], 1, function(x) {
+  vals <- x[!is.na(x)]
+  if (length(vals) == 1) {
+    return(vals)
+  } else {
+    return(NA)
+  }
+})
+
+mutation_vafs$mutation_vaf[is.na(mutation_vafs$mutation_vaf)] <- 0
+
+# Optionally drop the original columns
+mutation_vafs<- mutation_vafs[, c("group_id", "mutation_vaf")]
+scores <- merge(scores, mutation_vafs, by = "group_id", all.x = TRUE)
+```
+
+# Griffin Consensus Score 
+```{r}
+# Get the raw z-score columns
+zscore_cols <- grep("^AverageZScore_", colnames(scores), value = TRUE)
+
+# Create cumulative z-score column by summing raw z-scores row-wise
+scores$consensus_griffin <- rowSums(scores[, zscore_cols], na.rm = TRUE)
+```
+
+```{r}
+# Get the raw z-score columns
+zscore_cols <- grep("^AverageZScore_", colnames(control_scores), value = TRUE)
+
+# Create cumulative z-score column by summing raw z-scores row-wise
+control_scores$consensus_griffin <- rowSums(control_scores[, zscore_cols], na.rm = TRUE)
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive")]
+data <- merge(samples, scores, by.x = c("Library Name", "TS"), by.y = c("Library Name", "TS"), all.y = TRUE)
+
+# Drop samples with pending or UNK in months_to_positive
+data <- data[!data$months_to_positive %in% c("pending", "UNK"), ]
+data <- data[!data$group_id %in% c("LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0154-T0", "LIB-04-0664-T0"), ]
+```
+
+
+```{r}
+# Ensure months_to_positive is a character and clean spaces
+data$months_to_positive <- as.character(data$months_to_positive)
+data$months_to_positive <- trimws(data$months_to_positive)
+
+# Convert to numeric where possible, keeping "no_future_cancer" intact
+data$months_to_positive_numeric <- suppressWarnings(as.numeric(data$months_to_positive)) 
+```
+
+# Healthy BRCA1/2m-carriers vs. Healthy Control 
+```{r}
+healthy_brca12m_carriers <- data[data$cancer_status == "negative" & 
+                                 (!is.na(data$months_to_positive_numeric) & data$months_to_positive_numeric > 12 | 
+                                  data$months_to_positive == "no_future_cancer"), ]
+
+control_scores_cohort <- control_scores[, !colnames(control_scores) %in% "Sample", drop = FALSE]
+healthy_brca12m_carriers <- healthy_brca12m_carriers[, colnames(control_scores_cohort), drop = FALSE]
+
+# Add the roc_label column
+control_scores_cohort$roc_label <- 0
+healthy_brca12m_carriers$roc_label <- 1
+
+# Merge the two dataframes
+healthy_carriers_vs_control <- rbind(control_scores_cohort, healthy_brca12m_carriers)
+
+healthy_carriers_vs_control$Tumour.Fraction <- log1p(healthy_carriers_vs_control$Tumour.Fraction)
+healthy_carriers_vs_control$fragment_ratio_corr <- -log1p(1 - healthy_carriers_vs_control$fragment_ratio_corr)
+healthy_carriers_vs_control$Mutation <- factor(healthy_carriers_vs_control$Mutation, levels = c(0, 1))
+
+table(healthy_carriers_vs_control$roc_label)
+```
+
+# Negative BRCA1/2m-carriers vs. Positive BRCA1/2-carriers
+```{r}
+
+# Assign ROC labels
+brca_carriers_positive_vs_negative <- data[
+  data$cancer_status == "positive" |
+  (data$cancer_status == "negative" & data$months_to_positive == "no_future_cancer"),
+]
+
+brca_carriers_negative_with_future_cancer <- data[
+  data$cancer_status == "negative" & !is.na(data$months_to_positive_numeric),
+]
+brca_carriers_negative_with_future_cancer$roc_label <- 1
+
+brca_carriers_positive_vs_negative$roc_label <- ifelse(
+  brca_carriers_positive_vs_negative$cancer_status == "positive", 1, 0
+)
+
+brca_carriers_positive_vs_negative <- brca_carriers_positive_vs_negative[, c(
+  "FS", "avg_zscore_nuc_peaks", "fragment_ratio_corr", "Tumour.Fraction",
+  "Mutation", "consensus_griffin", "mutation_vaf", "roc_label"
+), drop = FALSE]
+
+# 2. Subset to desired columns
+brca_carriers_negative_with_future_cancer <- brca_carriers_negative_with_future_cancer[, c(
+  "FS", "avg_zscore_nuc_peaks", "fragment_ratio_corr", "Tumour.Fraction",
+  "Mutation", "consensus_griffin", "mutation_vaf", "roc_label"
+), drop = FALSE]
+
+
+set.seed(42)  # for reproducibility
+# Split off 50% of the negative samples
+negative_subset <- brca_carriers_positive_vs_negative %>%
+  dplyr::filter(roc_label == 0) %>%
+  slice_sample(prop = 0.5)
+
+# Keep the remaining samples
+brca_carriers_positive_vs_negative <- brca_carriers_positive_vs_negative %>%
+  anti_join(negative_subset)
+
+combined_negative <- rbind(negative_subset, brca_carriers_negative_with_future_cancer)
+
+combined_negative$Tumour.Fraction <- log1p(combined_negative$Tumour.Fraction)
+combined_negative$fragment_ratio_corr <- -log1p(1 - combined_negative$fragment_ratio_corr)
+combined_negative$Mutation <- factor(combined_negative$Mutation, levels = c(0, 1))
+table(combined_negative$roc_label)
+
+brca_carriers_positive_vs_negative$Tumour.Fraction <- log1p(brca_carriers_positive_vs_negative$Tumour.Fraction)
+brca_carriers_positive_vs_negative$fragment_ratio_corr <- -log1p(1 - brca_carriers_positive_vs_negative$fragment_ratio_corr)
+brca_carriers_positive_vs_negative$Mutation <- factor(brca_carriers_positive_vs_negative$Mutation, levels = c(0, 1))
+table(brca_carriers_positive_vs_negative$roc_label) 
+```
+
+```{r}
+# select_models <- c("glm", "knn", "svmRadial", "rf", "gbm")
+select_models <- c("glm", "knn", "svmRadial", "rf")
+```
+# Define features to be used in model 
+```{r, message=FALSE, echo=FALSE, warnings=FALSE}
+features <- c("FS", "avg_zscore_nuc_peaks", "fragment_ratio_corr", "Tumour.Fraction", "mutation_vaf", "consensus_griffin")
+print(features)
+```
+
+```{r}
+invisible(
+  capture.output(
+    results_healthy_vs_control <-
+      run_ml_pipeline_repeated(
+        healthy_carriers_vs_control,
+        outcome_col = "roc_label",
+        features    = features,
+        cohort_name = "neg_vs_control",
+        outdir_data = outdir_data_model,
+        base_seed = 124)
+      ) 
+    ) 
+rm(list = ls(pattern = "^model_"))
+```
+
+```{r}
+invisible(
+  capture.output(
+results_brca_carriers_positive_vs_negative <-
+      run_ml_pipeline_repeated(
+        brca_carriers_positive_vs_negative,
+        outcome_col = "roc_label",
+        features    = features,
+        cohort_name = "pos_vs_healthy_control",
+        outdir_data = outdir_data_model,
+        base_seed = 124)
+        ) 
+    ) 
+# after run_ml_pipeline_repeated(...)
+rm(list = ls(pattern = "^model_"))
+```
+
+```{r}
+validation_models <- results_brca_carriers_positive_vs_negative$median_models
+
+# 3) Evaluate all five median models on test_df
+eval_results <- evaluate_median_models(
+  median_models    = validation_models,
+  test_data        = combined_negative,
+  outcome_col      = "roc_label",
+  outdir_figures   = outdir_figures,
+  outdir_data = outdir_data, 
+  negative_label   = "Negative"
+)
+
+# Combine all confusion plots into one PDF
+combine_confusion_plots(eval_results, filename = "01_classifier_combined_confusion_matrix.pdf", outdir_figures = outdir_figures)
+
+combined_negative <- combined_negative[, c(features, "roc_label")]
+
+plot_roc_curves_from_results(
+  results_list    = eval_results,
+  test_data       = combined_negative,
+  outcome_col     = "roc_label",
+  outdir_figures  = outdir_figures,
+  filename_prefix = "01_classifier_validation"
+)
+```
+
+```{r}
+# Extract predictions
+all_predictions_healthy_vs_control <- results_healthy_vs_control$predictions
+all_predictions_brca_carriers_positive_vs_negative <- results_brca_carriers_positive_vs_negative$predictions
+
+# Extract performance scores
+all_scores_healthy_vs_control <- results_healthy_vs_control$scores
+all_scores_brca_carriers_positive_vs_negative <- results_brca_carriers_positive_vs_negative$scores
+```
+
+```{r}
+# Define output directory
+# Summarize results for both datasets
+final_scores_healthy_vs_control <- convert_results_to_df(all_scores_healthy_vs_control)
+final_scores_brca_carriers_positive_vs_negative <- convert_results_to_df(all_scores_brca_carriers_positive_vs_negative)
+
+# Print the summary of model performance
+print("Model Performance for Healthy vs. Control:")
+print(final_scores_healthy_vs_control)
+
+print("Model Performance for BRCA Positive vs. Negative:")
+print(final_scores_brca_carriers_positive_vs_negative)
+ 
+# Save the results as CSV files with correct filename prefix
+write.csv(final_scores_healthy_vs_control, 
+          file = file.path(outdir_data, paste0("01_processing_classifier_healthy_vs_control_", Sys.Date(), ".csv")), 
+          row.names = FALSE)
+
+write.csv(final_scores_brca_carriers_positive_vs_negative, 
+          file = file.path(outdir_data, paste0("01_processing_classifier_brca_positive_vs_negative_", Sys.Date(), ".csv")), 
+          row.names = FALSE)
+
+# Confirm file save
+print("Files saved successfully!")
+```
+
+
+
+```{r}
+roc_healthy_vs_control <- plot_roc_curve(
+  all_predictions_healthy_vs_control,
+  "ROC Curves - Cancer Negative BRCA1/2-carriers vs. Healthy Control",
+  scores_summary_df = final_scores_healthy_vs_control
+)
+
+roc_brca_positive_vs_negative <- plot_roc_curve(
+  all_predictions_brca_carriers_positive_vs_negative,
+  "ROC Curves - BRCA1/2-carriers: Positive vs. Negative",
+  scores_summary_df = final_scores_brca_carriers_positive_vs_negative
+)
+
+# Save Combined ROC Plots as  PDF
+ggsave(filename = file.path(outdir_figures, "01_processing_classifier_healthy_vs_control_ROC.pdf"), 
+       plot = roc_healthy_vs_control, width = 7, height = 6)
+
+ggsave(filename = file.path(outdir_figures, "01_processing_classifier_brca_positive_vs_negative_ROC.pdf"), 
+       plot = roc_brca_positive_vs_negative, width = 7, height = 6)
+
+roc_healthy_vs_control
+roc_brca_positive_vs_negative
+```
+
+```{r}
+# Save plots for healthy vs. control
+save_individual_roc_curves(
+  predictions_df = all_predictions_healthy_vs_control,
+  filename_prefix = "01_processing_classifier_brca_healthy_vs_control",
+  title = "ROC Curves - Healthy BRCAm-carriers vs. Healthy Control",
+  scores_summary_df = final_scores_healthy_vs_control
+)
+
+# Save plots for BRCA positive vs. negative
+save_individual_roc_curves(
+  predictions_df = all_predictions_brca_carriers_positive_vs_negative,
+  filename_prefix = "01_processing_classifier_brca_positive_vs_negative",
+  title = "ROC Curves - BRCAm-carriers: Positive vs. Negative",
+  scores_summary_df = final_scores_brca_carriers_positive_vs_negative
+)
+```
+
+```{r}
+outpath_path <- paste0(outdir_data, "/01_classifier_all_predictions_brca_carriers_positive_vs_negative_", Sys.Date(), ".csv")
+write.csv(all_predictions_brca_carriers_positive_vs_negative, outpath_path, row.names = FALSE)
+
+outpath_path_2 <- paste0(outdir_data, "/01_classifier_all_predictions_healthy_vs_control_", Sys.Date(), ".csv")
+write.csv(all_predictions_healthy_vs_control, outpath_path_2, row.names = FALSE)
+
+outpath_path_3 <- paste0(outdir_data, "/01_classifier_all_scores_healthy_vs_control_", Sys.Date(), ".csv")
+write.csv(all_scores_healthy_vs_control, outpath_path_3, row.names = FALSE)
+
+outpath_path_4 <- paste0(outdir_data, "/01_classifier_all_scores_brca_carriers_positive_vs_negative_", Sys.Date(), ".csv")
+write.csv(all_scores_brca_carriers_positive_vs_negative, outpath_path_4, row.names = FALSE)
+```
+
+```{r}
+# Usage:
+print_feature_importance(results_brca_carriers_positive_vs_negative$importances)
+```
+
+```{r}
+print_feature_importance(results_healthy_vs_control$importance)
+```

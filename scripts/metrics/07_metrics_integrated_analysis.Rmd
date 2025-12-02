@@ -1,0 +1,409 @@
+---
+title: "07_metrics_integrated_analysis"
+output: html_document
+date: "2025-04-03"
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(reshape2)
+library(ggformula)
+library(signal)
+library(matrixStats)
+library(lemon)
+library(ggpubr)
+library(data.table)
+library(readxl)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# read in data 
+scores_path <- here::here("data", "metrics", "01_metrics_integrated_cleaned.csv")
+valid_samples <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+```
+
+
+```{r}
+### --- Step 4: Define signal combinations ---
+
+# Sample-level classification
+valid_samples$fragmentomic_signal <- valid_samples$signal_nucleosome | 
+                                    valid_samples$signal_fragment_ratio | 
+                                    valid_samples$signal_fragment_length | 
+                                    valid_samples$signal_griffin
+
+valid_samples$genomic_signal <- valid_samples$signal_tf | 
+                               valid_samples$signal_mutation
+
+valid_samples$signal_combination <- paste0(
+    ifelse(valid_samples$fragmentomic_signal, "Fragmentomic_Positive", "Fragmentomic_Negative"), "_",
+    ifelse(valid_samples$genomic_signal, "Genomic_Positive", "Genomic_Negative")
+)
+
+### --- Sample-level table ---
+cat("\n===== Sample-Level Table =====\n")
+table_sample <- table(valid_samples$cancer_status, valid_samples$signal_combination)
+print(table_sample)
+
+
+### --- Patient-level classification (LIB_ID) ---
+
+# Create patient-level dataframe by collapsing LIB_IDs
+patient_signal_df <- aggregate(cbind(fragmentomic_signal, genomic_signal) ~ LIB_ID + cancer_status, data=valid_samples, FUN=function(x) any(x))
+
+# Create combination label
+patient_signal_df$signal_combination <- paste0(
+    ifelse(patient_signal_df$fragmentomic_signal, "Fragmentomic_Positive", "Fragmentomic_Negative"), "_",
+    ifelse(patient_signal_df$genomic_signal, "Genomic_Positive", "Genomic_Negative")
+)
+
+### --- Patient-level table ---
+cat("\n===== Patient-Level Table =====\n")
+table_patient <- table(patient_signal_df$cancer_status, patient_signal_df$signal_combination)
+print(table_patient)
+```
+
+```{r}
+### --- Step 7: Individual tool analysis ---
+
+# Define which tools you want to report
+tool_signals <- c("signal_nucleosome", 
+                  "signal_fragment_ratio", 
+                  "signal_fragment_length", 
+                  "signal_griffin", 
+                  "signal_tf", 
+                  "signal_mutation")
+
+tool_names <- c("Nucleosome Positioning",
+                "Fragment Ratio",
+                "Fragment Length",
+                "Griffin",
+                "Tumour Fraction (TF)",
+                "Somatic Mutation")
+
+# Function to summarize by tool
+summarize_tool <- function(tool_col) {
+  out <- data.frame(
+    tool = tool_col,
+    positive_samples = sum(valid_samples[[tool_col]] & valid_samples$cancer_status == "positive"),
+    negative_samples = sum(valid_samples[[tool_col]] & valid_samples$cancer_status == "negative"),
+    total_samples = sum(valid_samples[[tool_col]])
+  )
+  return(out)
+}
+
+# Apply summary to all tools
+tool_summary <- do.call(rbind, lapply(tool_signals, summarize_tool))
+
+# Attach human-readable names
+tool_summary$tool_description <- tool_names
+
+# Calculate percentages (optional)
+tool_summary$percent_positive <- round(tool_summary$positive_samples / sum(valid_samples$cancer_status == "positive") * 100, 1)
+tool_summary$percent_negative <- round(tool_summary$negative_samples / sum(valid_samples$cancer_status == "negative") * 100, 1)
+tool_summary$percent_total    <- round(tool_summary$total_samples / nrow(valid_samples) * 100, 1)
+
+# Reorder columns for readability
+tool_summary <- tool_summary[, c("tool_description", "positive_samples", "percent_positive",
+                                 "negative_samples", "percent_negative", 
+                                 "total_samples", "percent_total")]
+
+### --- Output nicely ---
+
+cat("\n===== Individual Tool Detection Summary =====\n")
+print(tool_summary, row.names=FALSE)
+```
+```{r}
+# Filter cancer-positive samples
+cancer_positive <- valid_samples[valid_samples$cancer_status == "positive", ]
+
+# Count per cancer type: how many with ≥1 signal
+signal_summary_by_type <- cancer_positive |>
+  dplyr::group_by(cancer_type) |>
+  dplyr::summarise(
+    total_samples = n(),
+    n_with_signal = sum(n_signals >= 1),
+    percent_with_signal = round(n_with_signal / total_samples * 100, 1)
+  ) |>
+  dplyr::arrange(desc(percent_with_signal))
+
+# View
+print(signal_summary_by_type)
+```
+
+```{r}
+summarize_integration_group <- function(df, group_label) {
+  cat("\n===== Integration Summary:", group_label, "=====\n")
+  
+  ## ---- Sample-level summary ----
+  total_samples <- nrow(df)
+  samples_with_signal <- df[df$n_signals >= 1, ]
+  total_signal_samples <- nrow(samples_with_signal)
+  percent_signal_samples <- round(total_signal_samples / total_samples * 100, 1)
+
+  cat("Samples with ≥1 signal:", total_signal_samples, "/", total_samples,
+      "(", percent_signal_samples, "%)\n")
+
+  # Samples with exactly X signals
+  for (i in 1:6) {
+    n_exact <- sum(samples_with_signal$n_signals == i)
+    percent_exact <- round(n_exact / total_signal_samples * 100, 1)
+    cat("Samples with exactly", i, "signals:", n_exact, "/", total_signal_samples,
+        "(", percent_exact, "%)\n")
+  }
+
+  # Samples with ≥ X signals
+  for (i in 1:6) {
+    n_atleast <- sum(samples_with_signal$n_signals >= i)
+    percent_atleast <- round(n_atleast / total_signal_samples * 100, 1)
+    cat("Samples with ≥", i, "signals:", n_atleast, "/", total_signal_samples,
+        "(", percent_atleast, "%)\n")
+  }
+
+  ## ---- Patient-level summary ----
+  patient_df <- aggregate(n_signals ~ LIB_ID, data = df, FUN = max)
+  total_individuals <- nrow(patient_df)
+  individuals_with_signal <- patient_df[patient_df$n_signals >= 1, ]
+  total_signal_individuals <- nrow(individuals_with_signal)
+  percent_signal_individuals <- round(total_signal_individuals / total_individuals * 100, 1)
+
+  cat("\nIndividuals with ≥1 signal:", total_signal_individuals, "/", total_individuals,
+      "(", percent_signal_individuals, "%)\n")
+
+  # Patients with exactly X signals (based on max signal per patient)
+  for (i in 1:6) {
+    n_exact <- sum(individuals_with_signal$n_signals == i)
+    percent_exact <- round(n_exact / total_signal_individuals * 100, 1)
+    cat("Patients with exactly", i, "signals:", n_exact, "/", total_signal_individuals,
+        "(", percent_exact, "%)\n")
+  }
+
+  # Patients with ≥ X signals
+  for (i in 1:6) {
+    n_atleast <- sum(individuals_with_signal$n_signals >= i)
+    percent_atleast <- round(n_atleast / total_signal_individuals * 100, 1)
+    cat("Patients with ≥", i, "signals:", n_atleast, "/", total_signal_individuals,
+        "(", percent_atleast, "%)\n")
+  }
+}
+```
+
+```{r}
+# Summarize cancer-negative samples
+cancer_negative <- valid_samples[valid_samples$cancer_status == "negative", ]
+
+# Cancer negative summary
+summarize_integration_group(cancer_negative, "Cancer-Negative Samples")
+```
+
+```{r}
+#  Cancer-positive summary 
+cancer_positive <- valid_samples[valid_samples$cancer_status == "positive", ]
+summarize_integration_group(cancer_positive, "Cancer-Positive Samples")
+```
+
+```{r}
+future_cancer_summary <- function(data, group_label = "", months_limit = NULL, signal_limit = 1) {
+  # ---- Step 1: Define future-cancer samples (months_to_positive numeric) ----
+  months_numeric_all <- suppressWarnings(as.numeric(data$months_to_positive))
+  future_cancer_samples <- data[!is.na(months_numeric_all), , drop = FALSE]
+
+  # recompute months on subset for clarity
+  future_cancer_samples$months_numeric <- suppressWarnings(
+    as.numeric(future_cancer_samples$months_to_positive)
+  )
+
+  if (!is.null(months_limit)) {
+    future_cancer_samples <- future_cancer_samples[
+      future_cancer_samples$months_numeric <= months_limit,
+      , drop = FALSE
+    ]
+  }
+
+  # ---- Step 2: Totals (samples & patients) ----
+  n_future_cancer        <- nrow(future_cancer_samples)
+  n_future_with_signal   <- sum(future_cancer_samples$n_signals >= signal_limit, na.rm = TRUE)
+  percent_future_signal  <- if (n_future_cancer > 0) round(100 * n_future_with_signal / n_future_cancer, 1) else NA_real_
+
+  future_cancer_ids            <- unique(future_cancer_samples$LIB_ID)
+  n_future_patients            <- length(future_cancer_ids)
+  future_cancer_ids_with_signal<- unique(future_cancer_samples$LIB_ID[future_cancer_samples$n_signals >= signal_limit])
+  n_future_patients_with_signal<- length(future_cancer_ids_with_signal)
+  percent_patients_with_signal <- if (n_future_patients > 0) round(100 * n_future_patients_with_signal / n_future_patients, 1) else NA_real_
+
+  # ---- Step 2a: Lead-time summary among signal-positive future-cancer patients (per-patient MAX) ----
+  if (n_future_patients_with_signal > 0) {
+    tmp <- future_cancer_samples[ future_cancer_samples$LIB_ID %in% future_cancer_ids_with_signal, , drop = FALSE ]
+    # per-patient max lead time
+    per_patient_max <- aggregate(months_numeric ~ LIB_ID, data = tmp, FUN = function(x) max(x, na.rm = TRUE))
+    max_months_signal_pos    <- max(per_patient_max$months_numeric, na.rm = TRUE)
+    median_months_signal_pos <- median(per_patient_max$months_numeric, na.rm = TRUE)
+    mean_months_signal_pos   <- round(mean(per_patient_max$months_numeric, na.rm = TRUE), 1)
+  } else {
+    per_patient_max          <- data.frame(LIB_ID = character(), months_numeric = numeric())
+    max_months_signal_pos    <- NA
+    median_months_signal_pos <- NA
+    mean_months_signal_pos   <- NA
+  }
+
+  # ---- Step 3: Proportions relative to all signal-positive in the provided data ----
+  n_signal_samples  <- sum(data$n_signals >= signal_limit, na.rm = TRUE)
+  n_signal_patients <- length(unique(data$LIB_ID[data$n_signals >= signal_limit]))
+  percent_signal_samples_future_cancer  <- if (n_signal_samples  > 0) round(100 * n_future_with_signal          / n_signal_samples, 1)  else NA_real_
+  percent_signal_patients_future_cancer <- if (n_signal_patients > 0) round(100 * n_future_patients_with_signal / n_signal_patients, 1) else NA_real_
+
+  # ---- Step 3b: Cancer-type breakdown (samples & patients) ----
+  # Prefer `next_positive_cancer` if present; else fall back to `cancer_type`
+  type_col <- if ("next_positive_cancer" %in% names(future_cancer_samples)) {
+    "next_positive_cancer"
+  } else if ("cancer_type" %in% names(future_cancer_samples)) {
+    "cancer_type"
+  } else NA_character_
+
+  labelify <- function(x) { x <- ifelse(is.na(x) | x == "", "Unknown", x); x }
+
+  sample_type_df <- patient_type_df <- data.frame()
+  if (!is.na(type_col) && n_future_cancer > 0) {
+    # SAMPLE-LEVEL: among all future-cancer samples
+    fc_types     <- labelify(future_cancer_samples[[type_col]])
+    fc_types_sig <- labelify(future_cancer_samples[[type_col]][future_cancer_samples$n_signals >= signal_limit])
+
+    # counts
+    sample_type_totals <- sort(table(fc_types), decreasing = TRUE)
+    sample_type_sig    <- table(fc_types_sig)
+
+    sample_type_df <- data.frame(
+      cancer_type    = names(sample_type_totals),
+      total_samples  = as.integer(sample_type_totals),
+      signal_samples = as.integer(sample_type_sig[names(sample_type_totals)]),
+      row.names = NULL
+    )
+    sample_type_df$signal_samples[is.na(sample_type_df$signal_samples)] <- 0L
+    sample_type_df$signal_rate_pct <- round(100 * sample_type_df$signal_samples / pmax(sample_type_df$total_samples, 1L), 1)
+
+    # PATIENT-LEVEL: map each future-cancer LIB_ID to a single type (first non-NA label)
+    per_patient_type <- aggregate(
+      future_cancer_samples[[type_col]],
+      by = list(LIB_ID = future_cancer_samples$LIB_ID),
+      FUN = function(v) { v <- v[!is.na(v) & v != ""]; if (length(v)) v[1] else NA_character_ }
+    )
+    names(per_patient_type)[2] <- "type"
+    per_patient_type$type <- labelify(per_patient_type$type)
+
+    pat_type_totals <- sort(table(per_patient_type$type), decreasing = TRUE)
+
+    sig_pat_ids <- future_cancer_ids_with_signal
+    per_patient_type_sig <- per_patient_type[per_patient_type$LIB_ID %in% sig_pat_ids, , drop = FALSE]
+    pat_type_sig <- table(per_patient_type_sig$type)
+
+    patient_type_df <- data.frame(
+      cancer_type     = names(pat_type_totals),
+      total_patients  = as.integer(pat_type_totals),
+      signal_patients = as.integer(pat_type_sig[names(pat_type_totals)]),
+      row.names = NULL
+    )
+    patient_type_df$signal_patients[is.na(patient_type_df$signal_patients)] <- 0L
+    patient_type_df$signal_rate_pct <- round(100 * patient_type_df$signal_patients / pmax(patient_type_df$total_patients, 1L), 1)
+  }
+
+  # ---- Step 4: Output ----
+  if (!is.null(months_limit)) {
+    cat("\n===== Future Cancer Development within", months_limit, "months", group_label, "=====\n")
+  } else {
+    cat("\n===== Future Cancer Development", group_label, "=====\n")
+  }
+
+  cat("Signal threshold: ≥", signal_limit, "signals\n")
+
+  cat("Samples that develop cancer:", n_future_cancer, "\n")
+  cat("With ≥", signal_limit, "signal(s) before cancer:", n_future_with_signal,
+      ifelse(is.na(percent_future_signal), "(NA%)", paste0("(", percent_future_signal, "%)")), "\n")
+
+  cat("Patients that develop cancer:", n_future_patients, "\n")
+  cat("  → LIB_IDs:", ifelse(n_future_patients > 0, paste(future_cancer_ids, collapse = ", "), "None"), "\n")
+
+  cat("Patients with ≥", signal_limit, "signal(s) before cancer:", n_future_patients_with_signal,
+      ifelse(is.na(percent_patients_with_signal), "(NA%)", paste0("(", percent_patients_with_signal, "%)")), "\n")
+  cat("  → LIB_IDs:", ifelse(n_future_patients_with_signal > 0, paste(future_cancer_ids_with_signal, collapse = ", "), "None"), "\n")
+
+  cat("\n===== Proportion relative to all Signal-Positive Samples / Patients in input data =====\n")
+  cat("Signal-positive samples:", n_signal_samples, "\n")
+  cat("→ Of those, later develop cancer",
+      ifelse(!is.null(months_limit), paste0(" within ", months_limit, " months:"), ":"),
+      n_future_with_signal, "(", ifelse(is.na(percent_signal_samples_future_cancer), "NA%", paste0(percent_signal_samples_future_cancer, "%)")), "\n")
+
+  cat("Signal-positive patients:", n_signal_patients, "\n")
+  cat("→ Of those, later develop cancer",
+      ifelse(!is.null(months_limit), paste0(" within ", months_limit, " months:"), ":"),
+      n_future_patients_with_signal, "(", ifelse(is.na(percent_signal_patients_future_cancer), "NA%", paste0(percent_signal_patients_future_cancer, "%)")), "\n")
+
+  cat("Max months_to_positive (signal-positive patients):", ifelse(is.na(max_months_signal_pos), "NA", max_months_signal_pos), "\n")
+  cat("Median months_to_positive (signal-positive patients):", ifelse(is.na(median_months_signal_pos), "NA", median_months_signal_pos), "\n")
+  cat("Mean months_to_positive (signal-positive patients):", ifelse(is.na(mean_months_signal_pos), "NA", mean_months_signal_pos), "\n")
+
+  if (nrow(sample_type_df)) {
+    cat("\n===== Cancer-type breakdown (future-cancer SAMPLES) =====\n")
+    print(sample_type_df, row.names = FALSE)
+  } else {
+    cat("\n===== Cancer-type breakdown (future-cancer SAMPLES) =====\nNone\n")
+  }
+
+  if (nrow(patient_type_df)) {
+    cat("\n===== Cancer-type breakdown (future-cancer PATIENTS) =====\n")
+    print(patient_type_df, row.names = FALSE)
+  } else {
+    cat("\n===== Cancer-type breakdown (future-cancer PATIENTS) =====\nNone\n")
+  }
+
+  invisible(list(
+    n_future_cancer = n_future_cancer,
+    n_future_with_signal = n_future_with_signal,
+    percent_future_signal = percent_future_signal,
+    n_future_patients = n_future_patients,
+    n_future_patients_with_signal = n_future_patients_with_signal,
+    percent_patients_with_signal = percent_patients_with_signal,
+    per_patient_max = per_patient_max,
+    max_months_signal_pos = max_months_signal_pos,
+    median_months_signal_pos = median_months_signal_pos,
+    mean_months_signal_pos = mean_months_signal_pos,
+    n_signal_samples = n_signal_samples,
+    n_signal_patients = n_signal_patients,
+    percent_signal_samples_future_cancer = percent_signal_samples_future_cancer,
+    percent_signal_patients_future_cancer = percent_signal_patients_future_cancer,
+    sample_type_df = sample_type_df,
+    patient_type_df = patient_type_df
+  ))
+}
+```
+
+
+```{r}
+# All future cancer
+future_cancer_summary(cancer_negative, group_label="(Cancer-Negative Samples)")
+```
+
+```{r}
+cancer_negative_survivor_yes <- valid_samples[valid_samples$source == "cancer_status_negative_survivor_yes", ]
+future_cancer_summary(cancer_negative_survivor_yes, group_label = "cancer_status_negative_survivor_yes")
+```
+
+```{r}
+future_cancer_summary(cancer_negative, group_label="(Cancer-Negative Samples)", signal_limit=2)
+```
+```{r}
+future_cancer_summary(cancer_negative, group_label="(Cancer-Negative Samples)", signal_limit=3)
+```
+
+
+```{r}
+# Future cancer within 12 months
+future_cancer_summary(cancer_negative, group_label="(Cancer-Negative Samples)", months_limit=12)
+```
+

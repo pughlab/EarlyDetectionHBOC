@@ -1,0 +1,535 @@
+---
+title: "02_figure_mutations_oncoplot_to_publish"
+output: html_document
+date: "`r Sys.Date()`"
+params: 
+  ichorCNA_estimate_table: "HBOC_ichorCNA_estimates.tsv"
+  HBC_ichorCNA_estimate_table: "HBC_ichorCNA_estimates.tsv"
+---
+
+### How to run this script. 
+1. First need to run mutect2 and haplotypecaller pipeline 
+2. Take the cbioportal.txt maf file that is created from the pipeline (now found in data/mutations)
+2. filter mutations - script found in data_processing/mutations/mutation_filtering.Rmd
+
+```{r}
+# Load necessary libraries
+library(ComplexHeatmap)
+library(dplyr)
+library(stringr)
+# Load the readxl package
+library(readxl)
+library(Polychrome)
+```
+
+```{r setup, include=FALSE}
+# Set project root for knitr (optional if using here())
+knitr::opts_knit$set(root.dir = here::here())
+
+# Define output directory (creates if it does not exist)
+outdir <- here::here("figures", "mutations")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+```
+
+```{r}
+# Read in the data
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet = "April22")
+samples <- samples[, !(names(samples) %in% c("tumor_fraction", "ploidy"))]
+
+# Keep your original sample filters
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+
+# Raw mutation data
+onco <- read_excel(here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+
+# Tumor fraction data
+tumour_fraction <- read.delim(here::here("raw_data", "ichorCNA", params$ichorCNA_estimate_table), sep = "\t")
+tumour_fraction <- tumour_fraction[, c("ID", "Tumour.Fraction")]
+
+# Tumor fraction data
+HBC_tumour_fraction <- read.delim(here::here("raw_data", "ichorCNA", params$HBC_ichorCNA_estimate_table), sep = "\t")
+HBC_tumour_fraction <- HBC_tumour_fraction[, c("ID", "Tumour.Fraction")]
+tumour_fraction_cutoff <- quantile(HBC_tumour_fraction$Tumour.Fraction, 0.99, na.rm = TRUE)
+```
+
+
+```{r}
+# Merging on Library Name in samples and ID in tumour_fraction
+samples <- merge(samples, tumour_fraction[, c("ID", "Tumour.Fraction")], 
+                 by.x = "Library Name", by.y = "ID", all.x = TRUE)
+
+# convert HGSOC to ovarian
+samples$cancer_type[samples$cancer_type %in% c("hgsoc", "thyroid, hgsoc")] <- "ovarian"
+samples$cancer_type[grepl("breast, hgsoc", samples$cancer_type)] <- "ovarian"
+
+
+# Remove specific group_id entries where no somatic variant calling was done
+remove_ids <- c("LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0154-T0", "LIB-04-0664-T0")
+
+# Filter out from both dataframes
+onco <- onco[!onco$group_id %in% remove_ids, ]
+samples <- samples[!samples$group_id %in% remove_ids, ]
+
+```
+
+## filter data
+```{r}
+
+onco <- onco %>% dplyr::rename(sample_ID = TS)
+
+# Drop the columns 'group_id' and 'Library Name' from the dataframe 'onco'
+onco <- onco %>% dplyr::select(sample_ID, vaf_BRCA2_somatic, vaf_BRCA1_somatic, vaf_TP53, vaf_PALB2, vaf_EPCAM, vaf_MSH6, vaf_ATM, vaf_ATR, BRCA1_germline,BRCA2_germline, BRCA1_somatic, BRCA2_somatic, TP53, PALB2, EPCAM, MSH6, ATM, ATR)
+
+# Replace values across the entire dataframe
+onco[onco == "Missense_Mutation"] <- "missense"
+onco[onco == "Nonsense_Mutation"] <- "stop"
+onco[onco == "Frame_Shift_Ins"] <- "frameshift"
+onco[onco == "Frame_Shift_Del"] <- "frameshift"
+onco[onco == "Splice_Site"] <- "splice_site"
+onco[onco == "Splice_Region"] <- "splice_site"
+onco[onco == "Deletion"] <- "deletion"
+onco[onco == "Duplication"] <- "duplication"
+onco[onco == "not_sequenced"] <- "not_sequenced"
+
+```
+
+```{r}
+# Drop rows where Sample_ID is NA
+onco <- onco %>% dplyr::filter(!is.na(sample_ID))
+
+samples <- samples %>% dplyr::select(-date_of_blood)
+```
+
+
+```{r}
+# replace empty boxes with "" instead of NA 
+# onco[, c(6:13)][is.na(onco[, c(6:13)])] <- ""
+
+# Convert columns 7 to 13 to character if they aren't already
+onco[, 10:19] <- lapply(onco[, 10:19], as.character)
+
+# Assign empty strings to NA values in columns 7 to 13
+onco[, 10:19][is.na(onco[, 10:19])] <- ""
+
+# Assign NA_real_ to NA values in the vaf column
+onco$vaf_BRCA2_somatic[is.na(onco$vaf_BRCA2_somatic)] <- NA_real_
+
+# Assign NA_real_ to NA values in the vaf column
+onco$vaf_BRCA1_somatic[is.na(onco$vaf_BRCA1_somatic)] <- NA_real_
+
+# only select samples that are in oncomatrix 
+samples <- samples[samples$TS %in% onco$sample_ID,]
+```
+
+## combine data 
+```{r}
+data <- merge(samples, onco, by.x="TS", by.y="sample_ID")
+```
+
+## Set clinical information and sample order
+```{r}
+data$cancer_status <- factor(data$cancer_status,
+                             levels = c("positive", "negative"),
+                             labels = c("Cancer Positive", "Cancer Negative"))
+
+column_split <- data$cancer_status
+```
+
+```{r}
+## Set cancer previous
+data$survivor <- factor(data$survivor, levels = c("no", "yes", ""),
+                                      labels = c("No", "Yes", "NA"))
+
+data$cancer_status <- factor(data$cancer_status, levels = c("Cancer Positive","Cancer Negative"))
+```
+
+### cancer type order
+```{r}
+# data_previous <- as.matrix(data$survivor)
+# row.names(data_previous) <- data$TS
+# data_type <- as.matrix(data$cancer_type)
+# row.names(data_type) <- data$TS 
+
+data$cancer_type[is.na(data$cancer_type)] <- ""
+data$cancer_type <- factor(data$cancer_type, levels=c("ovarian", "breast", "lung", "prostate","liver", "thyroid", "thymoma", "myeloma", "cervical", "endometrial", ""), 
+                           labels=c("Ovarian", "Breast", "Lung", "Prostate", "Liver", "Thyroid", "Thymoma", "Myeloma", "Cervical", "Endometrial", "NA"))
+
+
+```
+
+```{r}
+process_somatic_data <- function(data, col_indices) {
+  # Loop through the specified columns
+  for (col in col_indices) {
+    # Replace "NS" with NA
+    data[, col] <- ifelse(data[, col] == "NS", NA, data[, col])
+    # Convert the column to numeric
+    data[, col] <- as.numeric(data[, col])
+  }
+  return(data)
+}
+```
+# Format ichorCNA Tumour Fraction
+```{r}
+# Replace "NS" with NA and then multiply by 100 after converting to numeric
+data$Tumour.Fraction <- ifelse(data$Tumour.Fraction == "NS", NA, as.numeric(data$Tumour.Fraction) * 100)
+```
+
+```{r}
+data <- data %>%
+  mutate(
+    mut_BRCA1_somatic  = ifelse(BRCA1_somatic  != "", 1, 0),
+    mut_BRCA2_somatic  = ifelse(BRCA2_somatic  != "", 1, 0),
+    mut_TP53           = ifelse(TP53           != "", 1, 0),
+    mut_PALB2          = ifelse(PALB2          != "", 1, 0),
+    mut_BRCA1_germline = ifelse(BRCA1_germline != "", 1, 0),
+    mut_BRCA2_germline = ifelse(BRCA2_germline != "", 1, 0),
+    mutation_score = 64 * mut_BRCA1_somatic +
+                     32 * mut_BRCA2_somatic +
+                     16 * mut_TP53 +
+                      8 * mut_PALB2 +
+                      4 * mut_BRCA1_germline +
+                      2 * mut_BRCA2_germline
+  ) %>%
+  arrange(
+    cancer_status,
+    desc(mutation_score),
+    survivor,
+    factor(cancer_type, levels = c(
+      "Ovarian", "Breast", "Lung", "Mucinous",
+      "Neuroendocrine", "Peritoneal Papillary Serous Carcinoma",
+      "Prostate", "Liver", "Endocrine", "Thyroid", "Thymoma", "Myeloma", "Endometrial", "NA"
+    )),
+    desc(Tumour.Fraction)
+  ) %>%
+  dplyr::select(-starts_with("mut_"), -mutation_score)
+```
+
+```{r}
+data_ichor <- data.frame(TF = data$Tumour.Fraction,
+                         limit = (100*tumour_fraction_cutoff),
+                         vaf_BRCA2_somatic = data$vaf_BRCA2_somatic,
+                         vaf_BRCA1_somatic = data$vaf_BRCA1_somatic, 
+                         vaf_TP53 = data$vaf_TP53, 
+                         vaf_EPCAM = data$vaf_EPCAM, 
+                         vaf_PALB2 = data$vaf_PALB2, 
+                         vaf_MSH6 = data$vaf_MSH6, 
+                         vaf_ATM = data$vaf_ATM, 
+                         vaf_ATR = data$vaf_ATR,
+                         zero = 0)
+
+# Create a new column to store the values above 25 from the TF column
+data_ichor$TF_above_20 <- ifelse(data_ichor$TF > 15, 15, NA)
+
+# Set the values in the TF column to NA if they are greater than 25
+data_ichor$TF <- ifelse(data_ichor$TF > 15, NA, data_ichor$TF)
+
+data_ichor <- process_somatic_data(data_ichor, c(1:10))
+
+row.names(data_ichor) <- data$TS
+data_ichor <- as.matrix(data_ichor)
+```
+
+## Format oncoprint heatmap
+```{r}
+data_onco <- data[, c( "BRCA1_germline", "BRCA2_germline", "BRCA1_somatic", "BRCA2_somatic", "TP53", "EPCAM", "PALB2", "MSH6",  "ATM", "ATR")]
+data_onco[is.na(data_onco)] <- ""
+row.names(data_onco) <- data$TS # here again, sample names by WGS
+data_onco <- as.data.frame(t(data_onco))
+row.names(data_onco) <- c("BRCA1 (Germline)", "BRCA2 (Germline)", "BRCA1 (Somatic)", "BRCA2 (Somatic)", "TP53", "EPCAM","PALB2", "MSH6", "ATM", "ATR")
+data_onco <- as.matrix(data_onco)
+data_onco <- data_onco[ , data$TS] # here again, sample names by WGS
+```
+
+## Make oncoprint barplot (minus GL)
+
+```{r}
+# To exlude EPCAM, MSH6, ATM and ATR, need to do the following. If these genes should be included comment out the right_annotation and data_percent lines. They are redundant then. 
+data_onco <- data_onco[!rownames(data_onco) %in% c("EPCAM", "MSH6", "ATM", "ATR"), ]
+```
+
+
+```{r}
+# Step 1: Extract Positive and Negative IDs
+positive_ids <- samples$TS[samples$cancer_status %in% c("positive")]
+negative_ids <- samples$TS[samples$cancer_status %in% c("negative")]
+
+#data_onco_sub <- data_onco[-c(1:3), ]
+
+# Step 2: Subset data_onco by Column Names (Samples)
+data_onco_positive <- data_onco[, colnames(data_onco) %in% positive_ids, drop = FALSE]
+data_onco_negative <- data_onco[, colnames(data_onco) %in% negative_ids, drop = FALSE]
+
+# Step 3: Convert to Binary Format
+
+# Replace empty strings with NA in Positive and Negative Data
+data_onco_positive[data_onco_positive == "" | data_onco_positive == "not_sequenced"] <- NA
+data_onco_negative[data_onco_negative == "" | data_onco_negative == "not_sequenced"] <- NA
+
+data_onco_positive_binary <- ifelse(!is.na(data_onco_positive), 1, 0)
+data_onco_negative_binary <- ifelse(!is.na(data_onco_negative), 1, 0)
+
+# Step 4: Count Mutations
+positive_counts <- rowSums(data_onco_positive_binary)
+negative_counts <- rowSums(data_onco_negative_binary)
+
+# Step 5: Calculate Percentages (Optional)
+data_percent_positive <- (positive_counts / ncol(data_onco_positive)) * 100
+data_percent_positive <- paste0(round(data_percent_positive, 1), "%")
+
+data_percent_negative <- (negative_counts / ncol(data_onco_negative)) * 100
+data_percent_negative <- paste0(round(data_percent_negative, 1), "%")
+
+# Step 6: Create Right Annotation
+right_annotation <- rowAnnotation(
+  Positive_Barplot = anno_barplot(
+    positive_counts,
+    border = FALSE,
+    width = unit(1.6, "cm"),
+    gp = gpar(fill = "#fb9a99", col = NA),  # Color for positive barplot
+    axis_param = list(side = "top", labels_rot = 0, gp = gpar(fontsize = 12))
+  ),
+  Positive_Percent = anno_text(data_percent_positive, gp = gpar(fontsize = 13)),
+  Negative_Barplot = anno_barplot(
+    negative_counts,
+    border = FALSE,
+    width = unit(1.6, "cm"),
+    gp = gpar(fill = "#fb9a99", col = NA),  # Color for positive barplot
+    axis_param = list(side = "top", labels_rot = 0, gp = gpar(fontsize = 11))
+  ),
+  #width = unit(7, "cm"), 
+  Negative_Percent = anno_text(data_percent_negative, gp = gpar(fontsize = 13)),
+  show_annotation_name = FALSE
+)
+```
+
+# Set colours 
+```{r}
+## Set colours
+col <- c(missense = "#4DAF4A", missense2 = "#4DAF4A", frameshift = "black", stop = "#A65628",
+         splice_site = "#984EA3", exonic_deletion = "#ffb55a", deletion = "blue", duplication = "aquamarine2",
+         pos = "#fb9a99", not_sequenced = "grey65")
+
+col_type <- c(Ovarian = "#fd7f6f",  Breast = "#bd7ebe", Cervical = "#7eb0d5", Lung="#8bd3c7",  Prostate="#ebdc78", Liver="#fdcce5", "NA" = "white", Thyroid = "#ffb55a" , Thymoma="#4682b4", Myeloma="#9acd32", Endometrial = "blue")
+
+col_previous <- c(Yes = "#fb9a99", No = "grey95", "NA" = "green")
+
+```
+
+```{r}
+# Count occurrences of each LIB_ID
+lib_id_counts <- table(data$LIB_ID)
+
+# Assign "LIB-04-single" to LIB_IDs with only one occurrence
+data$LIB_ID <- ifelse(data$LIB_ID %in% names(lib_id_counts[lib_id_counts == 1]), "LIB-04-single", data$LIB_ID)
+
+# Now get the updated unique LIB_IDs
+unique_lib_ids <- unique(data$LIB_ID)
+
+# Create a custom palette based on the number of unique LIB_IDs
+num_patients <- length(unique_lib_ids) -1 # Including "LIB-04-single"
+P_custom <- createPalette(num_patients, c("#ff0000", "#00ff00", "#0000ff"))  # Excluding "LIB-04-single"
+
+# Assign the colors to LIB_IDs, excluding "LIB-04-single"
+lib_id_colors <- setNames(P_custom, unique_lib_ids[unique_lib_ids != "LIB-04-single"])
+
+# Add white color for "LIB-04-single"
+lib_id_colors["LIB-04-single"] <- "white"
+
+# Optionally display the color palette
+swatch(lib_id_colors)
+```
+
+```{r}
+## Set variables
+alter_fun = function(x, y, w, h, v) {
+  # background
+  grid.rect(x, y, w*0.8, h*0.9, gp = gpar(fill = "grey95", col = NA))
+  # alterations
+  n = sum(v)  # how many alterations for current gene in current sample
+  h = h
+  w = w
+  # use `names(which(v))` to correctly map between `v` and `col`
+  if(n) grid.rect(x, y - h*0.5 + 1:n/n*h, w, 1/n*h, 
+                  gp = gpar(fill = col[names(which(v))], col = "white"), just = "top")
+}
+```
+
+```{r}
+n_samples <- ncol(data_onco)
+pdf_width <- min(16, 0.11 * n_samples + 2)   # Scale width based on number of samples
+pdf_height <- pdf_width * 10 / 16           # Maintain 16:10 ratio
+print(pdf_width)
+print(pdf_height)
+```
+
+
+## Set additional annotations
+```{r}
+# order is the columns of data_ichor: TF, limit, vaf_BRCA2_somatic, vaf_BRCA1_somatic, vaf_TP53, vaf_PALB2, vaf_EPCAM, vaf_MSH6, vaf_ATM, vaf_ATR, zero, TF_above_20
+# I need to move the values of TF above 25 to new column to give them a new symbol
+top_annotation <- HeatmapAnnotation("Tumour Fraction" = anno_lines(data_ichor,
+                                                                   add_points = TRUE,
+                                                                   pch = c(16, NA, 4, 4, 4, 4, 4, 4, 4, 4, NA, 17),
+                                                                   which = "column", 
+                                                                   gp = gpar(col = c(NA, "red", NA, "blue", NA),
+                                                                             lty = c("blank", "dashed", "blank", "blank", "blank", 
+                                                                                     "blank", "blank", "blank", "blank", "blank", "blank", "blank")),
+                                                                   pt_gp = gpar(col = c("black", NA, "red",
+"red",
+"red",
+"red",
+"red",
+"red",
+"red",
+"red"  , NA, "black")),
+                                                                   size = unit(max(1.2, 0.06 * pdf_width * 2.54), "mm"),  # scales point size
+                                                                   axis_param = list(side = "left",
+                                                                                     labels_rot = 0,
+                                                                                     gp = gpar(fontsize = 12)),
+                                                                   border = FALSE,
+                                                                   height = unit(max(1.2, 0.2 * pdf_height), "cm")),
+                                    
+                                   
+                                    "Cancer Type" = data$cancer_type,
+                                    "Cancer History" = data$survivor,
+                                    #"Patient" = data$LIB_ID, # Adding LIB_ID to the annotation
+                                    col = list("Somatic Mutations" = col,
+                                               "Cancer Type" = col_type,
+                                               "Cancer History" = col_previous, 
+                                               "Patient" = lib_id_colors),
+                                    annotation_name_side = "left",
+                                    annotation_name_rot = 0,
+                                    annotation_name_gp= gpar(fontsize = 14),
+                                    annotation_name_offset = unit(8, "mm"), 
+                                    simple_anno_size = unit(0.2 * nrow(data_onco), "cm"),
+                                    border = FALSE,
+                                    show_legend = c(FALSE, FALSE, FALSE, FALSE, FALSE, FALSE),
+                                    gap = unit(c(2,1,0,0,0), "mm"))
+
+```
+
+
+```{r}
+## Set labels
+## Set labels (enlarged)
+annotation_legend <- packLegend(
+  list = list(
+    Legend(
+      title       = "Cancer History",
+      at          = c("Yes"),
+      legend_gp   = gpar(fill       = c("#fb9a99")),
+      title_gp    = gpar(fontsize   = 16, fontface = "bold"),
+      labels_gp   = gpar(fontsize   = 14),
+      grid_height = unit(4, "mm"),
+      grid_width  = unit(4, "mm")
+    ),
+    Legend(
+      title       = "Cancer Type",
+      at          = c("Ovarian", "Cervical", "Breast", "Lung",
+                   "Prostate", "Liver", "NA", 
+                  "Thyroid", "Thymoma", "Myeloma", "Endometrial"),
+      legend_gp   = gpar(fill       = c("#fd7f6f","#7eb0d5","#bd7ebe","#8bd3c7",
+                                     "#ebdc78", "#fdcce5", "white",
+                                      "#ffb55a" ,"#4682b4","#9acd32", "blue")),
+      title_gp    = gpar(fontsize   = 16, fontface = "bold"),
+      labels_gp   = gpar(fontsize   = 14),
+      grid_height = unit(4, "mm"),
+      grid_width  = unit(4, "mm"),
+      nrow        = 4
+    ),
+    Legend(
+      title       = "IchorCNA",
+      graphics    = list(
+        function(x, y, w, h) grid.points(x, y, w*0.5, h*0.5, gp = gpar(col = "black"), pch = 16),
+        function(x, y, w, h) grid.points(x, y, w*0.5, h*0.5, gp = gpar(col = "red"),   pch = 4),
+        function(x, y, w, h) grid.points(x, y, w*0.5, h*0.5, gp = gpar(col = "black"), pch = 17),
+        function(x, y, w, h) grid.rect  (x, y, w,   h*0,   gp = gpar(col = "red"))
+      ),
+      labels      = c("Tumor Fraction", "VAF of Somatic Mutation",
+                      "Tumour Fraction above 15%", "Tumour Fraction LOD"),
+      title_gp    = gpar(fontsize   = 16, fontface = "bold"),
+      labels_gp   = gpar(fontsize   = 14),
+      grid_height = unit(4, "mm"),
+      grid_width  = unit(4, "mm"),
+      nrow        = 4,
+      direction   = "horizontal"
+    ),
+    Legend(
+      title       = "Alterations",
+      at          = c("Missense", "Frameshift", "Stop", "Splice Site",
+                      "Exonic Deletion", "Failed Sequencing",
+                      "Deletion", "Duplication"),
+      legend_gp   = gpar(fill       = c("#4DAF4A","black","#A65628","#984EA3",
+                                        "#ffb55a","grey65","blue","aquamarine2")),
+      title_gp    = gpar(fontsize   = 16, fontface = "bold"),
+      labels_gp   = gpar(fontsize   = 14),
+      grid_height = unit(4, "mm"),
+      grid_width  = unit(4, "mm"),
+      nrow        = 4
+    )
+  ),
+  max_height = unit(6, "cm"),
+  row_gap    = unit(0.5, "cm"),
+  direction  = "horizontal"
+)
+```
+
+```{r}
+## Set splits
+column_split <- data$cancer_status
+
+
+col_order <- colnames(data_onco)
+
+row_order <- row.names(data_onco)
+```
+
+```{r}
+## Generate oncoprint
+
+pdf(file.path(outdir, "01_figure_mutations_oncoprint_to_publish.pdf"), width = 14, height = 7)
+oncoPrint <- oncoPrint(data_onco,
+                       alter_fun = alter_fun, 
+                       col = col,
+                       show_heatmap_legend = FALSE,
+                       row_order = row_order,
+                       row_names_side = "left",
+                       column_order = col_order,
+                       #cluster_columns = TRUE,
+                       show_pct = FALSE,
+                       # show_column_names = TRUE,
+                       # column_names_gp = gpar(fontsize = 5),  # Set the column names font size here
+                       top_annotation = top_annotation,
+                       right_annotation = right_annotation,
+                       row_names_gp = gpar(fontsize = 15, fontface = c(rep("plain", 2), rep("italic", 10))),
+                       column_split = column_split,
+                       column_title_gp = gpar(fontsize = 20),
+                       border = FALSE,
+                       #height = unit(2*nrow(data_onco), "cm")
+                       #column_names_side = "bottom" # Show column names at the bottom
+)
+draw(oncoPrint, heatmap_legend_list = annotation_legend, show_annotation_legend = FALSE, heatmap_legend_side = "bottom")
+
+decorate_annotation("Positive_Barplot", {
+  grid.text(
+    "Mutations\nCancer Pos.",
+    x  = unit(0.75, "npc"),
+    y  = unit(1.15, "npc") + unit(6, "mm"),  # was 1.07 → now 1.10
+    gp = gpar(fontsize = 13, face = "bold")
+  )
+})
+decorate_annotation("Negative_Barplot", {
+  grid.text(
+    "Mutations\nCancer Neg.",
+    x  = unit(0.70, "npc"),
+    y  = unit(1.15, "npc") + unit(6, "mm"),
+    gp = gpar(fontsize = 13, face = "bold")
+  )
+})
+
+dev.off()
+
+
+```

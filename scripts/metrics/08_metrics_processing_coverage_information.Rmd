@@ -1,0 +1,79 @@
+---
+title: "08_metrics_processing_coverage_information"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+
+
+form1 <- here::here("raw_data", "coverage", "2024-05-16-HBOC-OICR Genomics Sample Submission Form.xlsm")
+form1 <- read_excel(form1, sheet="Samples")
+form1 <- form1[,c("Sample ID")]
+
+form2 <- here::here("raw_data", "coverage", "2024-06-13-CHARM-HBOC-OICR Genomics Sample Submission Form.xlsm")
+form2 <- read_excel(form2, sheet="Samples")
+form2 <- form2[,c("Sample ID")]
+```
+
+```{r}
+# Define the fix function
+fix_sample_id <- function(x) {
+  x <- sub("-P$", "", x)           # Remove -P at end
+  x <- sub("(-B)$", "\\1-DNA", x)  # Add -DNA to -B at end
+  return(x)
+}
+
+# Clean column names
+colnames(form1) <- trimws(gsub("\u00A0", " ", colnames(form1)))
+colnames(form2) <- trimws(gsub("\u00A0", " ", colnames(form2)))
+
+# Apply fix if "Sample ID" exists
+if ("Sample ID" %in% colnames(form1)) {
+  form1$`Sample ID` <- fix_sample_id(form1$`Sample ID`)
+}
+
+if ("Sample ID" %in% colnames(form2)) {
+  form2$`Sample ID` <- fix_sample_id(form2$`Sample ID`)
+}
+```
+
+
+```{r}
+# Step 1: Combine and deduplicate Sample IDs from form1 and form2
+combined_form <- unique(rbind(form1, form2))
+
+# Step 2: Clean samples$group_id by removing "-old"
+samples$group_id_clean <- sub("-old$", "", samples$group_id)
+
+# Step 3: Check which Sample IDs match
+matched_logical <- combined_form$`Sample ID` %in% samples$group_id_clean
+
+# Step 4: Split into matched and unmatched
+matched_df <- combined_form[matched_logical, , drop = FALSE]
+unmatched_df <- combined_form[!matched_logical, , drop = FALSE]
+
+# Summary
+cat("Unique Sample IDs total:", nrow(combined_form), "\n")
+cat("Matched Sample IDs:", nrow(matched_df), "\n")
+cat("Unmatched Sample IDs:", nrow(unmatched_df), "\n")
+```

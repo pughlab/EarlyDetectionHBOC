@@ -1,0 +1,316 @@
+---
+title: "02_figure_cohort_swimmer_with_cfMeDIP"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+outdir <- here::here("figures", "cohort") 
+# metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx") 
+metadata_path <- "/Users/erikensminger/Library/CloudStorage/OneDrive-UniversityofToronto/HBOC_cohort_metadata.xlsx" 
+metadata <- read_excel(metadata_path, sheet="April22")
+```
+
+```{r}
+# drop the rows with timepoint buffy 
+metadata <- metadata[!(metadata$timepoint %in% c("buffy", "tumour")) & !(is.na(metadata$`Library Name`) & is.na(metadata$TS) & is.na(metadata$cfMeDIP)), ]
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+metadata$TS[metadata$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+metadata <- metadata[!grepl("T-788-T0", metadata$group_id), ]
+metadata <- metadata[!grepl("T-207-T0", metadata$group_id), ]
+
+# remove cfMeDIP samples 
+metadata  <- metadata[!grepl("LIB-04-0649-T0", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0441-T1", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0024-T2", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0131-T0", metadata$group_id), ]
+```
+
+```{r}
+# Find baseline timepoint based on first positive sample or first date_of_blood if none are positive
+baseline_timepoint <- metadata %>%
+  group_by(LIB_ID) %>%
+  dplyr::summarise(
+    baseline = if (any(cancer_status == "positive")) {
+      min(date_of_blood[cancer_status == "positive"])
+    } else {
+      min(date_of_blood)
+    },
+    n = n()
+  )
+
+# Repeat baseline dates across rows to add as a new column
+baseline_dates <- rep(baseline_timepoint$baseline, baseline_timepoint$n)
+metadata$baseline <- baseline_dates
+```
+
+```{r}
+# Calculate time_from_baseline in months
+metadata <- metadata %>%
+  mutate(
+    time_from_baseline = as.numeric(difftime(date_of_blood, baseline, units = "days")) / 30.44  # Average days per month
+  )
+```
+
+```{r}
+data_sero <- distinct(metadata, LIB_ID, cancer_status, .keep_all= TRUE)
+homo_sero <- data_sero[!(data_sero$LIB_ID %in% data_sero$LIB_ID[duplicated(data_sero$LIB_ID)]), ]
+
+```
+
+```{r}
+
+library(dplyr)
+library(dplyr)
+
+# Step 1: Classify each LIB_ID including single timepoint cases
+data_sero <- data_sero %>%
+  group_by(LIB_ID) %>%
+  arrange(timepoint) %>%
+  dplyr::summarise(
+    converter = case_when(
+      # Forward Phenoconverter: transition from negative to positive
+      n() > 1 & any(cancer_status == "negative" & lead(cancer_status) == "positive") ~ "Forward \nPhenoconverters",
+      # Reverse Phenoconverter: transition from positive to negative
+      n() > 1 & any(cancer_status == "positive" & lead(cancer_status) == "negative") ~ "Reverse \nPhenoconverters",
+      # Active Cancer: positive throughout or single positive timepoint
+      all(cancer_status == "positive") ~ "Active Cancer",
+      # Cancer Free: negative throughout or single negative timepoint
+      all(cancer_status == "negative") ~ "Cancer Free",
+      # Multiple Cancers: has a mix of positive and negative without straightforward conversion
+      TRUE ~ "Multiple Cancers"
+    )
+  )
+
+# Step 2: Set factor levels for ordered categories
+data_sero$converter <- factor(data_sero$converter, levels = c(
+  "Multiple Cancers", "Forward \nPhenoconverters", "Reverse \nPhenoconverters", "Active Cancer", "Cancer Free"
+))
+```
+
+```{r}
+# Merge the converter classification back to metadata
+metadata <- metadata %>%
+  left_join(data_sero, by = "LIB_ID")
+
+```
+
+```{r}
+metadata <- metadata %>%
+  mutate(
+    data_type = case_when(
+      `Library Name` != "" & !is.na(`Library Name`) &
+        TS != "" & !is.na(TS) &
+        cfMeDIP != "" & !is.na(cfMeDIP) ~ "WGS + TS + cfMeDIP",
+      
+      `Library Name` != "" & !is.na(`Library Name`) &
+        TS != "" & !is.na(TS) &
+        (is.na(cfMeDIP) | cfMeDIP == "") ~ "WGS + TS",
+      
+      `Library Name` != "" & !is.na(`Library Name`) &
+        (is.na(TS) | TS == "") &
+        cfMeDIP != "" & !is.na(cfMeDIP) ~ "WGS + cfMeDIP",
+      
+      (is.na(`Library Name`) | `Library Name` == "") &
+        TS != "" & !is.na(TS) &
+        cfMeDIP != "" & !is.na(cfMeDIP) ~ "TS + cfMeDIP",
+      
+      `Library Name` != "" & !is.na(`Library Name`) &
+        (is.na(TS) | TS == "") &
+        (is.na(cfMeDIP) | cfMeDIP == "") ~ "only WGS",
+      
+      (is.na(`Library Name`) | `Library Name` == "") &
+        TS != "" & !is.na(TS) &
+        (is.na(cfMeDIP) | cfMeDIP == "") ~ "only TS",
+      
+      (is.na(`Library Name`) | `Library Name` == "") &
+        (is.na(TS) | TS == "") &
+        cfMeDIP != "" & !is.na(cfMeDIP) ~ "only cfMeDIP",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+# Factor with specified levels for shape consistency
+metadata$data_type <- factor(
+  metadata$data_type,
+  levels = c(
+    "WGS + TS + cfMeDIP",
+    "WGS + TS",
+    "WGS + cfMeDIP",
+    "TS + cfMeDIP",
+    "only WGS",
+    "only TS",
+    "only cfMeDIP"
+  )
+)
+```
+
+```{r}
+# Order LIB_ID based on the number of samples per LIB_ID
+# Step 1: Calculate the number of samples per LIB_ID and sort by count
+sample_counts <- metadata %>%
+  group_by(LIB_ID) %>%
+  dplyr::summarise(n = n()) %>%
+  arrange(n)
+
+# Step 2: Use the sorted LIB_ID order as levels in metadata
+ordered_LIB_IDs <- sample_counts$LIB_ID
+metadata$LIB_ID <- factor(metadata$LIB_ID, levels = ordered_LIB_IDs)
+```
+
+```{r}
+### Plot data
+custom_theme <- theme(
+    plot.title = element_text(hjust = 0, face = "bold", size = 14),     # Smaller title
+    axis.line = element_line(colour = "black", linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill = NA),
+    strip.text = element_text(size = 11),                               # Facet labels
+    strip.text.y = element_text(angle = 0, size = 12, face = "bold"),
+    legend.justification = c("left", "bottom"),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 11),
+    legend.spacing.y = unit(0, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.title = element_text(size = 11.5),
+    legend.position = "bottom",
+    axis.text = element_text(size = 11),
+    axis.text.y = element_blank(),     # Hidden y-axis labels
+    axis.title = element_text(size = 12),
+    axis.title.x = element_text(size = 12, vjust = -1),
+    plot.margin = margin(5, 10, 10, 10),                                # Tighter margins
+    # strip.placement.y = "outside",
+    panel.spacing.y = unit(1, "lines")
+)
+
+```
+
+
+```{r}
+# Plot data with data_type as shape
+plot_pheno_status <- ggplot(metadata, aes(time_from_baseline, LIB_ID, group = LIB_ID, color = cancer_status, shape = data_type)) + 
+  geom_line(color = "grey", size = 1) +        # Thinner line
+  geom_point(size = 4, stroke = 1.5) +         # Smaller points
+  ggtitle("HBOC: Overview of Cancer Status and Sequencing Availability") +
+  xlab("Months from Baseline") +
+  ylab("Patient") +
+  labs(color = "Cancer Status", shape = "Sequencing Type Available") +
+  scale_color_manual(values = c("black", "red")) +
+  scale_shape_manual(values = c(
+  "WGS + TS" = 1,           # cross
+  "only WGS" = 0,           # open square
+  "only TS" = 17,            # open circle
+  "WGS + TS + cfMeDIP" = 16, # star
+  "WGS + cfMeDIP" = 2,      # open triangle
+  "TS + cfMeDIP" = 5,       # diamond
+  "only cfMeDIP" = 6        # upside-down triangle
+)) + 
+  facet_grid(converter ~ ., scales = "free_y", space = "free_y", switch = ) +
+  custom_theme + 
+  guides(shape = guide_legend(ncol = 2))
+
+  
+plot_pheno_status
+```
+
+```{r}
+# Save plot with reduced dimensions
+ggsave(file.path(outdir, "02_figure_cohort_timelines_by_converters.pdf"), 
+       plot_pheno_status, width = 20, height = 20)
+```
+
+
+### grouping by source 
+```{r}
+# Plot data with data_type as shape
+plot_pheno_source <- ggplot(metadata, aes(time_from_baseline, LIB_ID, group = LIB_ID, color = source, shape = data_type)) + 
+  geom_line(color = "grey", size = .35) +  # Line color remains grey
+  geom_point(size = 1.5, stroke = 1) +   # Smaller points
+  ggtitle("HBOC: Overview of Cancer Status, History, and Sequencing Availability") +
+  xlab("Months from Baseline") +
+  ylab("Patient") +
+  labs(
+    color = "Group",  # Legend title for source
+    shape = "Sequencing Type Available"
+  ) +
+  scale_color_manual(
+    values = c(
+      "cancer_status_negative_survivor_yes" = "#1f77b4",
+      "cancer_status_negative_survivor_no" = "#9467bd",
+      "cancer_status_positive_survivor_yes" = "#f4c842",
+      "first_positive_survivor_no" = "#f87544"
+    ),
+    labels = c(
+      "cancer_status_negative_survivor_yes" = "Cancer Negative (Survivor Yes)",
+      "cancer_status_negative_survivor_no" = "Cancer Negative (Survivor No)",
+      "cancer_status_positive_survivor_yes" = "Cancer Positive (Survivor Yes)",
+      "first_positive_survivor_no" = "Cancer Positive (First Positive)"
+    )
+  ) +
+  scale_shape_manual(values = c(
+  "WGS + TS" = 1,           # cross
+  "only WGS" = 0,           # open square
+  "only TS" = 17,            # open circle
+  "WGS + TS + cfMeDIP" = 16, # star
+  "WGS + cfMeDIP" = 2,      # open triangle
+  "TS + cfMeDIP" = 5,       # diamond
+  "only cfMeDIP" = 6        # upside-down triangle
+)) + 
+  facet_grid(converter ~ ., scales = "free_y", space = "free_y") +
+  custom_theme + 
+  guides(
+    color = guide_legend(
+      title = "Cancer Status",
+      ncol = 2,                # single column
+      direction = "vertical", # title on top
+      title.position = "top"
+    ),
+    shape = guide_legend(
+      title = "Sequencing Type Available",
+      ncol = 2,                # two columns
+      direction = "vertical", # title on top
+      title.position = "top"
+    )
+  ) 
+
+plot_pheno_source
+```
+
+```{r}
+
+# Save plot with reduced dimensions
+ggsave(file.path(outdir, "02_figure_cohort_timelines_by_converters_and_source.pdf"), 
+       plot_pheno_source, width = 9, height = 9.2)
+```
+
+```{r}
+# Combine the plots side by side
+combined_plot_cohort <- plot_grid(plot_pheno_status, plot_pheno_source, ncol = 2, align = "hv", axis = "tb", rel_widths = c(1,1))
+```
+
+```{r}
+# Save the combined plot
+ggsave(file.path(outdir, "02_figure_cohort_timelines_combined_plots.pdf"), combined_plot_cohort, width = 30, height = 20)
+```

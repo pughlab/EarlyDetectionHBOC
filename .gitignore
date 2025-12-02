@@ -1,0 +1,19 @@
+# RStudio session files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Ignore raw data, data, and figures folders (including all subfolders)
+raw_data/
+data/
+figures/
+
+# macOS
+*.DS_Store
+
+# RStudio project file (optional)
+*.Rproj
+
+# Ignore generated HTML reports
+HTML/*.html

@@ -1,0 +1,359 @@
+---
+title: "03_figure_metrics_score_significance_test"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(reshape2)
+library(ggformula)
+library(signal)
+library(matrixStats)
+library(lemon)
+library(ggpubr)
+library(data.table)
+library(readxl)
+library(car)
+library(ggplot2)
+library(ggsignif)
+library(broom)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+```{r}
+outdir_figures <- "./figures/metrics/03_metrics_score_boxplots"
+if (!dir.exists(outdir_figures)) dir.create(outdir_figures, recursive = TRUE)
+
+outdir_data <- "./data/metrics/03_metrics_score_boxplots" 
+if (!dir.exists(outdir_data)) dir.create(outdir_data, recursive = TRUE)
+
+diagnostic_dir <- "./figures/metrics/03_metrics_distribution_diagnostics"
+if (!dir.exists(diagnostic_dir)) dir.create(diagnostic_dir, recursive = TRUE)
+```
+
+```{r}
+# read in data 
+scores_path <- here::here("data", "statistics", "01_statistics_HBOC_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+scores <- scores[!grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", scores$TS),]
+scores <- scores[!grepl("T-788-T0", scores$group_id), ]
+scores <- scores[!grepl("T-207-T0", scores$group_id), ]
+scores <- scores[!(is.na(scores$TS) | scores$TS == "" | is.na(scores$`Library Name`) | scores$`Library Name` == ""), ]
+
+control_scores_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+control_scores <- read.csv(control_scores_path, header=TRUE, check.names=FALSE)
+
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", samples$TS), ]
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+
+samples$TS[samples$group_id == 'LIB-04-0154-T0'] <- "TGL49_0085_Cf_U_PE_4150_WG"
+samples$TS[samples$group_id == 'LIB-04-0376-T2'] <- "TGL49_0291_Pl_T_PE_405_PG"
+samples$TS[samples$group_id == 'LIB-04-0428-T3'] <- "TGL49_0293_Pl_T_PE_385_PG"
+samples$TS[samples$group_id == 'LIB-04-0664-T0'] <- "TGL49_0252_Cf_n_PE_1110_WG"
+
+#samples <- samples[!(is.na(samples$TS) | samples$TS == "" | is.na(samples$`Library Name`) | samples$`Library Name` == ""), ]
+samples <- samples[!(is.na(samples$`Library Name`) | samples$`Library Name` == ""), ]
+```
+
+```{r}
+samples <- samples[, c("Library Name", "TS", "source")]
+data <- merge(samples, scores, by.x = c("Library Name", "TS"), by.y = c("Library Name", "TS"), all.y = TRUE)
+```
+
+```{r}
+# Step 1: Rename Sample to Library Name
+colnames(control_scores)[colnames(control_scores) == "Sample"] <- "Library Name"
+
+# Step 2: Add missing columns
+control_scores$cfMeDIP <- NA
+control_scores$Mutation <- ""
+control_scores$group_id <- NA
+control_scores$TS <- control_scores$`Library Name`  # use Library Name as placeholder
+control_scores$HBOC_breast <- NA
+control_scores$HBOC_ovarian <- NA
+control_scores$LIB_ID <- control_scores$`Library Name`
+
+# Step 3: Add source and cancer_status
+control_scores$source <- "Healthy Control"
+control_scores$cancer_status <- "Healthy Control"
+
+# Step 4: Make sure the column order matches
+control_scores <- control_scores[, colnames(data)]
+
+# Step 5: Merge
+merged_data <- rbind(data, control_scores)
+```
+
+```{r}
+# Factor setup (no \n in internal labels)
+merged_data$source <- factor(merged_data$source, 
+  levels = c(
+    "Healthy Control", 
+    "first_positive_survivor_no", 
+    "cancer_status_positive_survivor_yes", 
+    "cancer_status_negative_survivor_no", 
+    "cancer_status_negative_survivor_yes"
+  ),
+  labels = c(
+    "Healthy Control", 
+    "Cancer Positive (First Positive)", 
+    "Cancer Positive (Survivor Yes)", 
+    "Cancer Negative (Survivor No)", 
+    "Cancer Negative (Survivor Yes)"
+  )
+)
+
+# Create display labels with line breaks for plots only
+source_display_labels <- c(
+  "Healthy Control" = "Healthy\nControl",
+  "Cancer Positive (First Positive)" = "Cancer Positive\n(First Positive)",
+  "Cancer Positive (Survivor Yes)" = "Cancer Positive\n(Survivor Yes)", 
+  "Cancer Negative (Survivor No)" = "Cancer Negative\n(Survivor No)",
+  "Cancer Negative (Survivor Yes)" = "Cancer Negative\n(Survivor Yes)"
+)
+
+merged_data$cancer_status <- factor(merged_data$cancer_status, 
+  levels = c("positive", "negative", "Healthy Control"),
+  labels = c("Positive", "Negative", "Healthy Control")
+)
+
+# --- Setup ---
+metrics <- c("FS", "fragment_ratio_corr", "avg_zscore_nuc_peaks", "consensus_griffin", "Tumour.Fraction")
+pretty_names <- c("Fragment Length Score", "Fragment Ratio Score", "Nucleosome Peak Score", "Griffin Score", "Tumour Fraction")
+
+source_colors <- c(
+  "Cancer Positive (Survivor Yes)"    = "#f4c842",
+  "Cancer Negative (Survivor Yes)"    = "#1f77b4",
+  "Cancer Positive (First Positive)"  = "#f87544",
+  "Cancer Negative (Survivor No)"     = "#9467bd",
+  "Healthy Control"                   = "#2ca02c"
+)
+
+cancer_status_colors <- c(
+  "Positive"        = "red",
+  "Negative"        = "gray",
+  "Healthy Control" = "#2ca02c"
+)
+
+# Combined storage for all p-values
+all_pvalues_combined <- data.frame()
+
+for (i in seq_along(metrics)) {
+  metric <- metrics[i]
+  pretty_label <- pretty_names[i]
+
+  ## --------------------------
+  ## Group-wise (by `source`)
+  ## --------------------------
+  cat("Processing (by group):", metric, "\n")
+  pvals_group <- compare_means(
+    formula = as.formula(paste0(metric, " ~ source")),
+    data = merged_data,
+    method = "wilcox.test",
+    p.adjust.method = "holm",
+    paired = FALSE,
+    na.rm = TRUE
+  )
+
+  # Add metric and comparison type info to group results
+  pvals_group$metric <- metric
+  pvals_group$comparison_type <- "by_group"
+  
+  max_val <- max(merged_data[[metric]], na.rm = TRUE)
+  min_val <- min(merged_data[[metric]], na.rm = TRUE)
+  range_val <- max_val - min_val
+
+  # Filter significant results FIRST
+  pvals_group_sig <- pvals_group[pvals_group$p.adj < 0.05, ]
+  
+  # Calculate bracket positions ONLY for significant results
+  if (nrow(pvals_group_sig) > 0) {
+    base_y <- max_val + 0.02 * range_val
+    pvals_group_sig$y.position <- base_y + seq_len(nrow(pvals_group_sig)) * 0.04 * range_val
+    pvals_group_sig$label <- pvals_group_sig$p.signif
+    # Position stars above their corresponding brackets
+    pvals_group_sig$y.position <- pvals_group_sig$y.position + 0.015 * range_val
+  }
+
+  p1 <- ggplot(merged_data, aes(x = source, y = .data[[metric]])) +
+    geom_boxplot(aes(fill = source), outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5) +
+    scale_fill_manual(values = source_colors) +
+    scale_x_discrete(labels = source_display_labels) +
+    labs(
+      title = paste(pretty_label, "Distribution by BRCA1/2-carrier Group"),
+      y = pretty_label,
+      x = "BRCA1/2-carrier Group"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14),
+      axis.title.y = element_text(size = 14),
+      axis.text.y = element_text(size = 12),
+      axis.title.x = element_text(size = 14),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+      axis.line = element_line(color = "black"),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+
+  if (nrow(pvals_group_sig) > 0) {
+    p1 <- p1 + stat_pvalue_manual(pvals_group_sig,
+      label = "label", y.position = "y.position", tip.length = 0.00, size = 5) +
+      coord_cartesian(ylim = c(min_val * 0.95, max(pvals_group_sig$y.position) * 1.05))
+  }
+
+  ggsave(
+    filename = file.path(outdir_figures, paste0("05_figure_metrics_", metric, "_by_group.pdf")),
+    plot = p1, width = 8, height = 6
+  )
+
+  ## -----------------------------
+  ## Status-wise (by `cancer_status`)
+  ## -----------------------------
+  cat("Processing (by status):", metric, "\n")
+  pvals_status <- compare_means(
+    formula = as.formula(paste0(metric, " ~ cancer_status")),
+    data = merged_data,
+    method = "wilcox.test",
+    p.adjust.method = "holm",
+    paired = FALSE,
+    na.rm = TRUE
+  )
+
+  # Add metric and comparison type info to status results
+  pvals_status$metric <- metric
+  pvals_status$comparison_type <- "by_status"
+
+  max_val2 <- max(merged_data[[metric]], na.rm = TRUE)
+  min_val2 <- min(merged_data[[metric]], na.rm = TRUE)
+  range_val2 <- max_val2 - min_val2
+
+  # Filter significant results FIRST
+  pvals_status_sig <- pvals_status[pvals_status$p.adj < 0.05, ]
+  
+  # Calculate bracket positions ONLY for significant results
+  if (nrow(pvals_status_sig) > 0) {
+    base_y2 <- max_val2 + 0.02 * range_val2
+    pvals_status_sig$y.position <- base_y2 + seq_len(nrow(pvals_status_sig)) * 0.04 * range_val2
+    pvals_status_sig$label <- pvals_status_sig$p.signif
+    # Position stars above their corresponding brackets
+    pvals_status_sig$y.position <- pvals_status_sig$y.position + 0.015 * range_val2
+  }
+
+  p2 <- ggplot(merged_data, aes(x = cancer_status, y = .data[[metric]])) +
+    geom_boxplot(aes(fill = cancer_status), outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5) +
+    scale_fill_manual(values = cancer_status_colors) +
+    labs(
+      title = paste(pretty_label, "Distribution by Cancer Status"),
+      y = pretty_label,
+      x = "Cancer Status"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14),
+      axis.title.y = element_text(size = 14),
+      axis.text.y = element_text(size = 12),
+      axis.title.x = element_text(size = 14),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+      axis.line = element_line(color = "black"),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+
+  if (nrow(pvals_status_sig) > 0) {
+    p2 <- p2 + stat_pvalue_manual(pvals_status_sig,
+      label = "label", y.position = "y.position", tip.length = 0.00, size = 5) +
+      coord_cartesian(ylim = c(min_val2 * 0.95, max(pvals_status_sig$y.position) * 1.05))
+  }
+
+  ggsave(
+    filename = file.path(outdir_figures, paste0("05_figure_metrics_", metric, "_by_status.pdf")),
+    plot = p2, width = 8, height = 6
+  )
+  
+  # --- Save combined plot ---
+  combined_plot <- ggarrange(p1, p2, ncol = 2, align = "hv")
+  ggsave(
+    filename = file.path(outdir_figures, paste0("05_figure_metrics_", metric, "_combined.pdf")),
+    plot = combined_plot, width = 12, height = 6
+  )
+  
+  # Combine both group and status results for this metric
+  all_pvalues_combined <- rbind(all_pvalues_combined, pvals_group, pvals_status)
+}
+
+# Export combined table with both p and p.adj values
+if (nrow(all_pvalues_combined) > 0) {
+  write.table(
+    all_pvalues_combined[, c("metric", "comparison_type", ".y.", "group1", "group2", "p", "p.adj", "p.signif")],
+    file = file.path(outdir_data, "wilcox_pvalues_combined_all_comparisons.tsv"),
+    sep = "\t", quote = FALSE, row.names = FALSE
+  )
+  
+  # Also create a version with only significant results
+  all_pvalues_combined_sig <- all_pvalues_combined[all_pvalues_combined$p.adj < 0.05, ]
+  if (nrow(all_pvalues_combined_sig) > 0) {
+    write.table(
+      all_pvalues_combined_sig[, c("metric", "comparison_type", ".y.", "group1", "group2", "p", "p.adj", "p.signif")],
+      file = file.path(outdir_data, "wilcox_pvalues_combined_significant_only.tsv"),
+      sep = "\t", quote = FALSE, row.names = FALSE
+    )
+  }
+}
+```
+
+
+```{r}
+
+for (i in seq_along(metrics)) {
+  metric <- metrics[i]
+  pretty_label <- pretty_names[i]
+
+  # Drop NA values
+  df <- merged_data[!is.na(merged_data[[metric]]), ]
+
+  # Plot histogram
+  p_hist <- ggplot(df, aes(x = .data[[metric]])) +
+    geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+    facet_wrap(~source, scales = "free") +
+    labs(title = paste("Histogram of", pretty_label), x = pretty_label, y = "Count") +
+    theme_minimal()
+
+  # Plot QQ plot
+  p_qq <- ggplot(df, aes(sample = .data[[metric]])) +
+    stat_qq() + stat_qq_line() +
+    facet_wrap(~source, scales = "free") +
+    labs(title = paste("QQ-Plot of", pretty_label), x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal()
+
+  # Save plots
+  ggsave(filename = file.path(diagnostic_dir, paste0(metric, "_histogram.pdf")), plot = p_hist, width = 8, height = 5)
+  ggsave(filename = file.path(diagnostic_dir, paste0(metric, "_qqplot.pdf")), plot = p_qq, width = 8, height = 5)
+
+  # Optional: print Shapiro-Wilk test (not ideal for large n, but useful for small groups)
+  cat("\n===== Shapiro-Wilk test for:", metric, "=====\n")
+  for (group in unique(df$source)) {
+    vec <- df[df$source == group, metric]
+    if (length(vec) >= 3 && length(vec) <= 5000) {  # Shapiro limit is 5000
+      test <- shapiro.test(vec)
+      cat("Group:", group, "-> p =", format.pval(test$p.value, digits = 4), "\n")
+    } else {
+      cat("Group:", group, "-> Skipped (n too small or too large)\n")
+    }
+  }
+}
+```
+

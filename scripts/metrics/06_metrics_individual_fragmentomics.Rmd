@@ -1,0 +1,354 @@
+---
+title: "06_metrics_individual_fragmentomics"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# Define paths
+outdir <- here::here("figures", "statistics")
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+# Ensure output directory exists
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+# Read in data
+scores <- read.csv(scores_path, header = TRUE, check.names = FALSE)
+scores_normal <- read.csv(scores_normal_path, header = TRUE, check.names = FALSE)
+
+# Load sample metadata
+samples <- readxl::read_excel(metadata_path, sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("group_id", "Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive")]
+```
+
+```{r}
+# Exclusions
+ban_group <- c("T-788-T0","T-207-T0","LIB-04-0649-T0",
+               "LIB-04-0441-T1","LIB-04-0024-T2","LIB-04-0131-T0")
+ban_ts_wgs <- c("TGL49_0085_Cf_U_PE_4150_WG",
+                "TGL49_0291_Pl_T_PE_405_PG",
+                "TGL49_0293_Pl_T_PE_385_PG",
+                "TGL49_0252_Cf_n_PE_1110_WG")
+
+# Remove unwanted samples **before merge**
+samples <- samples[!(samples$group_id %in% ban_group), ]
+scores  <- scores[ !(scores$group_id %in% ban_group), ]
+
+# Clean `TS` in both data frames
+samples$TS[samples$TS %in% ban_ts_wgs] <- NA
+scores$TS[scores$TS %in% ban_ts_wgs]   <- NA
+
+# --- Merge ---
+# If you want to KEEP all samples (and still bring in matching scores):
+data <- merge(samples, scores, by = c("group_id", "Library Name", "TS"), all.x = TRUE)
+
+# --- Check ---
+# table(is.na(data$TS))        # see if any missing TS remain
+# table(is.na(data$source))    # source should be NA only for unmatched rows
+
+``` 
+
+```{r}
+nucleosome_peak_cutoff <- quantile(scores_normal$avg_zscore_nuc_peaks, 0.99, na.rm = TRUE)
+tumour_fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+fragment_ratio_cutoff <- quantile(scores_normal$fragment_ratio_corr , 0.01, na.rm = TRUE)
+fragment_length_cutoff <- quantile(scores_normal$FS , 0.99, na.rm = TRUE)
+consensus_griffin_cutoff <- quantile(scores_normal$consensus_griffin, 0.01, na.rm = TRUE)
+integrated_ctDNA_score_cutoff <- 0.5 
+```
+
+
+```{r}
+# Define valid samples (Library Name not NA or empty)
+valid_samples <- data[!is.na(data$`Library Name`) & data$`Library Name` != "", ]
+
+# Remove samples with months_to_positive == "UNK" or "pending"
+#valid_samples <- valid_samples[!valid_samples$months_to_positive %in% c("UNK", "pending"), ]
+```
+
+```{r}
+table(valid_samples$source)
+```
+
+```{r}
+summarize_ctdna_metric <- function(samples, metric_col, is_positive_fn, label) {
+  # Helper
+  safe_pct <- function(num, den) {
+    if (is.na(den) || den == 0) return("NA%")
+    paste0(round(100 * num / den, 1), "%")
+  }
+
+  # Filter out NA metric values
+  valid_samples <- samples[!is.na(samples[[metric_col]]), ]
+  positive_samples <- valid_samples[is_positive_fn(valid_samples[[metric_col]]), ]
+  positive_samples <- positive_samples[rowSums(!is.na(positive_samples)) > 0, ]
+
+  total_valid  <- nrow(valid_samples)
+  count_pos    <- nrow(positive_samples)
+  percent_pos  <- if (total_valid > 0) round(100 * count_pos / total_valid, 1) else NA
+
+  cat("\n=================================================\n")
+  cat(" Metric:", label, "\n")
+  cat("=================================================\n")
+  cat("Total valid (non-NA):", total_valid, "\n",
+      "Positives:", count_pos, sprintf("(%.1f%%)\n", percent_pos))
+
+  # Overall summary of metric
+  vals_all <- valid_samples[[metric_col]]
+  cat("\nOverall summary of", metric_col, ":\n")
+  cat(
+    " Mean:",   round(mean(vals_all, na.rm=TRUE), 2),
+    " SD:",     round(sd(vals_all,   na.rm=TRUE), 2),
+    " Min:",    round(min(vals_all,  na.rm=TRUE), 2),
+    " 25th%:",  round(quantile(vals_all, .25, na.rm=TRUE), 2),
+    " Median:", round(median(vals_all, na.rm=TRUE), 2),
+    " 75th%:",  round(quantile(vals_all, .75, na.rm=TRUE), 2),
+    " Max:",    round(max(vals_all,  na.rm=TRUE), 2), "\n"
+  )
+
+  # Breakdown of positive samples by cancer_status
+  cat("\n-----------------------------------------------\n")
+  cat(" Breakdown of Positive Samples by Cancer Status\n")
+  cat("-----------------------------------------------\n")
+  cs_tab <- table(positive_samples$cancer_status, useNA = "ifany")
+  cs_perc <- if (sum(cs_tab) > 0) round(prop.table(cs_tab) * 100, 1) else cs_tab
+  summary_cs <- data.frame(
+    Cancer_Status = names(cs_tab),
+    Count = as.integer(cs_tab),
+    Percent = if (sum(cs_tab) > 0) paste0(as.numeric(cs_perc), "%") else rep("NA%", length(cs_tab)),
+    row.names = NULL
+  )
+  print(summary_cs, row.names = FALSE)
+
+  # Breakdown of positive samples by source
+  cat("\n-----------------------------------------------\n")
+  cat(" Breakdown of Positive Samples by Source\n")
+  cat("-----------------------------------------------\n")
+  src_tab <- table(positive_samples$source, useNA = "ifany")
+  src_perc <- if (sum(src_tab) > 0) round(prop.table(src_tab) * 100, 1) else src_tab
+  summary_src <- data.frame(
+    Source = names(src_tab),
+    Count = as.integer(src_tab),
+    Percent = if (sum(src_tab) > 0) paste0(as.numeric(src_perc), "%") else rep("NA%", length(src_tab)),
+    row.names = NULL
+  )
+  print(summary_src, row.names = FALSE)
+
+  # Unique LIB_IDs
+  cat("\n-----------------------------------------------\n")
+  cat(" Unique LIB_IDs among Positive Samples\n")
+  cat("-----------------------------------------------\n")
+  unique_ids <- unique(positive_samples$LIB_ID)
+  cat("Total unique LIB_IDs:", length(unique_ids), "\n")
+  if (length(unique_ids) > 0) print(unique_ids)
+
+  # Negative vs positive breakdown by cancer_status
+  cat("\n-----------------------------------------------\n")
+  cat(" Negative vs Positive Breakdown by Cancer Status\n")
+  cat("-----------------------------------------------\n")
+  neg_all_flag <- valid_samples$cancer_status == "negative"
+  pos_all_flag <- valid_samples$cancer_status == "positive"
+  total_neg <- sum(neg_all_flag, na.rm = TRUE)
+  total_pos <- sum(pos_all_flag, na.rm = TRUE)
+  neg_pos <- sum(positive_samples$cancer_status == "negative", na.rm = TRUE)
+  pos_pos <- sum(positive_samples$cancer_status == "positive", na.rm = TRUE)
+  summary_np <- data.frame(
+    Cancer_Status   = c("Negative", "Positive"),
+    Total           = c(total_neg, total_pos),
+    Positive_Calls  = c(neg_pos,   pos_pos),
+    Percent_Positive = c(safe_pct(neg_pos, total_neg), safe_pct(pos_pos, total_pos)),
+    row.names = NULL
+  )
+  print(summary_np, row.names = FALSE)
+
+  # Negative vs positive breakdown by source
+  cat("\n-----------------------------------------------\n")
+  cat(" Negative vs Positive Breakdown by Source\n")
+  cat("-----------------------------------------------\n")
+  source_levels <- sort(unique(valid_samples$source))
+  summary_source_np <- data.frame(
+    Source = character(),
+    Total = numeric(),
+    Positive_Calls = numeric(),
+    Percent_Positive = character(),
+    stringsAsFactors = FALSE
+  )
+  for (s in source_levels) {
+    total_s <- sum(valid_samples$source == s, na.rm = TRUE)
+    pos_s   <- sum(positive_samples$source == s, na.rm = TRUE)
+    summary_source_np <- rbind(
+      summary_source_np,
+      data.frame(
+        Source = ifelse(is.na(s), "NA", as.character(s)),
+        Total = total_s,
+        Positive_Calls = pos_s,
+        Percent_Positive = safe_pct(pos_s, total_s)
+      )
+    )
+  }
+  if (nrow(summary_source_np) > 0) print(summary_source_np, row.names = FALSE)
+
+  # Future cancer breakdown for negative positives
+  cat("\n-----------------------------------------------\n")
+  cat(" Future Cancer Analysis for Cancer-Negative Positives\n")
+  cat("-----------------------------------------------\n")
+  neg_samps   <- positive_samples[positive_samples$cancer_status == "negative", ]
+  months_num  <- suppressWarnings(as.numeric(neg_samps$months_to_positive))
+  unk_pend    <- sum(neg_samps$months_to_positive %in% c("UNK", "pending"))
+  fut_idx     <- !is.na(months_num)
+  fut_all     <- sum(fut_idx)
+  fut_12      <- sum(months_num < 12, na.rm=TRUE)
+  max_months  <- if (fut_all > 0) round(max(months_num[fut_idx], na.rm=TRUE), 1) else NA
+  mean_months <- if (fut_all > 0) round(mean(months_num[fut_idx], na.rm=TRUE), 1) else NA
+  med_months  <- if (fut_all > 0) round(median(months_num[fut_idx], na.rm=TRUE), 1) else NA
+  cat(
+    " Neg-pos total:", nrow(neg_samps), "\n",
+    " UNK/pending:", unk_pend, sprintf(" (%.1f%%)\n", 100 * unk_pend / nrow(neg_samps)),
+    " Future cancer (>0):", fut_all, sprintf(" (%.1f%%)\n", 100 * fut_all / nrow(neg_samps)),
+    " <12 mo:", fut_12, sprintf(" (%.1f%%)\n", 100 * fut_12 / nrow(neg_samps)),
+    " Max months:", max_months, " Mean months:", mean_months, " Median months:", med_months, "\n"
+  )
+
+  # Summary by source
+  cat("\n-----------------------------------------------\n")
+  cat(" Summary of", metric_col, "by Source\n")
+  cat("-----------------------------------------------\n")
+  by_src <- split(valid_samples[[metric_col]], valid_samples$source)
+  for (s in names(by_src)) {
+    v <- by_src[[s]]
+    cat(
+      " Source:", ifelse(is.na(s), "NA", s),
+      " Mean:",   round(mean(v, na.rm=TRUE), 2),
+      " Median:", round(median(v, na.rm=TRUE), 2),
+      " SD:",     round(sd(v,   na.rm=TRUE), 2),
+      " Min:",    round(min(v,  na.rm=TRUE), 2),
+      " Max:",    round(max(v,  na.rm=TRUE), 2),
+      " Range:",  paste0("[", round(min(v, na.rm=TRUE),2), ", ", round(max(v, na.rm=TRUE),2), "]"),
+      " IQR:",    round(IQR(v, na.rm=TRUE), 2), "\n"
+    )
+  }
+
+  # Summary by cancer_status
+  cat("\n-----------------------------------------------\n")
+  cat(" Summary of", metric_col, "by Cancer Status\n")
+  cat("-----------------------------------------------\n")
+  by_stat <- split(valid_samples[[metric_col]], valid_samples$cancer_status)
+  for (st in names(by_stat)) {
+    v <- by_stat[[st]]
+    cat(
+      " Status:", ifelse(is.na(st), "NA", st),
+      " Mean:",   round(mean(v,   na.rm=TRUE), 2),
+      " Median:", round(median(v, na.rm=TRUE), 2),
+      " SD:",     round(sd(v,     na.rm=TRUE), 2),
+      " Min:",    round(min(v,    na.rm=TRUE), 2),
+      " Max:",    round(max(v,    na.rm=TRUE), 2),
+      " Range:",  paste0("[", round(min(v, na.rm=TRUE),2), ", ", round(max(v, na.rm=TRUE),2), "]"),
+      " IQR:",    round(IQR(v,     na.rm=TRUE), 2), "\n"
+    )
+  }
+}
+```
+
+```{r}
+summarize_ctdna_metric(
+  valid_samples,
+  "integrated_ctDNA_score",
+  function(x) !is.na(x) & x >= integrated_ctDNA_score_cutoff,
+  "Integrated ctDNA Score (>= 0.5)"
+)
+```
+
+```{r}
+# Run summaries for each metric
+summarize_ctdna_metric(
+  valid_samples,
+  "avg_zscore_nuc_peaks",
+  function(x) !is.na(x) & x > nucleosome_peak_cutoff,
+  "Nucleosome Peaks (Z-score > 99th percentile)"
+)
+```
+
+```{r}
+summarize_ctdna_metric(
+  valid_samples,
+  "fragment_ratio_corr",
+  function(x) !is.na(x) & x < fragment_ratio_cutoff,
+  "Fragment Ratio (Corr < 1st percentile)"
+)
+```
+
+```{r}
+summarize_ctdna_metric(
+  valid_samples,
+  "FS",
+  function(x) !is.na(x) & x > fragment_length_cutoff,
+  "Fragment Length (FS < 99th percentile)"
+)
+```
+
+```{r}
+summarize_ctdna_metric(
+  valid_samples,
+  "consensus_griffin",
+  function(x) !is.na(x) & x < consensus_griffin_cutoff,
+  "Consensus GRIFFIN Score (>= 1)"
+)
+```
+
+```{r}
+# Run summaries for each metric
+summarize_ctdna_metric(
+  valid_samples,
+  "Tumour.Fraction",
+  function(x) !is.na(x) & x > tumour_fraction_cutoff,
+  "Tumour Fraction (TF > 99th percentile)"
+)
+
+```

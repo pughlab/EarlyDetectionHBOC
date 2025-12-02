@@ -1,0 +1,260 @@
+---
+title: "griffin_healthy_correlation"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(matrixStats)
+library(reshape2)
+library(ggh4x)
+library(ggpubr)
+library(RColorBrewer)
+library(readxl)
+library(pROC)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+
+```{r}
+# outdir 
+outdir <- here::here("data", "nucleosome_peaks")
+date <- Sys.Date();
+
+### Set paths
+path <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_nucleosome_peak_reshaped.csv")
+healthy_path <- here::here("data", "HBOC_pipeline_output", "control", "control_nucleosome_peak_reshaped.csv")
+
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+data_sum <- read.csv(path, check.names=FALSE)
+data_normal_sum <- read.csv(healthy_path, check.names=FALSE)
+metadata <- read_excel(metadata_path, sheet="April22")
+
+# remove failed samples 
+metadata <- metadata[!grepl("T-788-T0",  metadata$group_id), ]
+metadata <- metadata[!grepl("T-207-T0", metadata$group_id), ]
+
+
+# Adding ".downSample_peak_distance" to each value in the column
+data_sum <- data_sum[data_sum$Sample %in% metadata$'Library Name',]
+
+# Ensure failed samples are removed
+data_sum <- data_sum[!grepl("T-788-T0",  data_sum$Sample), ]
+data_sum <- data_sum[!grepl("T-207-T0", data_sum$Sample), ]
+
+```
+
+```{r}
+data_sum <- data_sum[, colnames(data_sum) %in% c("Sample", -83:83)]  
+
+# 
+data_normal_sum <- data_normal_sum[, colnames(data_normal_sum) %in% c("Sample", -83:83)]  
+
+```
+
+```{r}
+data_sum[,2:ncol(data_sum)] <- data_sum[,2:ncol(data_sum)]/rowSums(data_sum[,2:ncol(data_sum)])*100
+data_normal_sum[,2:ncol(data_normal_sum)] <- data_normal_sum[,2:ncol(data_normal_sum)]/rowSums(data_normal_sum[,2:ncol(data_normal_sum)])*100
+# Assuming `data_sum` contains the cancer samples and `data_normal_sum` contains the normal samples
+
+# 1. Calculate the healthy median and standard deviation (already provided)
+normal_median <- colMedians(as.matrix(data_normal_sum[, 2:ncol(data_normal_sum)]))
+normal_sd <- colSds(as.matrix(data_normal_sum[, 2:ncol(data_normal_sum)]))
+
+# 2. Calculate z-scores for each cancer sample
+z_scores <- sweep(data_sum[, 2:ncol(data_sum)], 2, normal_median, FUN = "-")
+z_scores <- sweep(z_scores, 2, normal_sd, FUN = "/")
+z_scores <- abs(z_scores)
+# 3. Calculate the average z-score for each cancer sample across all distances
+average_z_scores <- rowMeans(z_scores, na.rm = TRUE)
+# 3.1. Add the average z-scores to your cancer data
+data_sum$avg_zscore_nuc_peaks <- average_z_scores
+
+
+# 4. Calculate z-score for each healthy
+z_scores_normal <- sweep(data_normal_sum[, 2:ncol(data_normal_sum)], 2, normal_median, FUN = "-")
+z_scores_normal <- sweep(z_scores_normal, 2, normal_sd, FUN = "/")
+z_scores_normal <- abs(z_scores_normal)
+# 5. Calculate the average z-score for each cancer sample across all distances
+average_z_scores_normal <- rowMeans(z_scores_normal, na.rm = TRUE)
+# 5.1. Add the average z-scores to normal data
+data_normal_sum$avg_zscore_nuc_peaks <- average_z_scores_normal
+
+```
+
+```{r}
+# 1 Compute the 95th percentile of normal samples
+threshold_95 <- quantile(data_normal_sum$avg_zscore_nuc_peaks, probs = 0.99, na.rm = TRUE)
+# threshold_95 <- 1.96 
+# 2 Classify samples using the 95th percentile threshold
+predictions_95 <- ifelse(data_sum$avg_zscore_nuc_peaks >= threshold_95, "positive", "negative")
+
+# 3 Create a results dataframe
+results_95 <- data.frame(
+  Sample = data_sum$Sample,
+  avg_zscore_nuc_peaks = data_sum$avg_zscore_nuc_peaks,
+  Predicted_95th_Percentile = predictions_95
+)
+
+# 4 Print threshold and classification counts
+print(paste("95th Percentile Threshold:", round(threshold_95, 2)))
+print(table(predictions_95))
+
+# 5 Boxplot for visualizing the threshold comparison
+boxplot(data_normal_sum$avg_zscore_nuc_peaks, data_sum$avg_zscore_nuc_peaks,
+        names = c("Normal", "Test Group"),
+        main = "Comparison of Average Z-Scores with 95th Percentile Threshold")
+abline(h = threshold_95, col = "red", lty = 2)  # Mark threshold line
+legend("topright", legend = "95th Percentile Threshold", col = "red", lty = 2)
+```
+
+```{r}
+# 1 Prepare Data for ROC Analysis
+normal_scores <- data_normal_sum$avg_zscore_nuc_peaks  # Control group
+cancer_scores <- data_sum$avg_zscore_nuc_peaks         # Test group
+
+# 2 Assign labels: 0 = Normal, 1 = Cancer
+roc_labels <- c(rep(0, length(normal_scores)), rep(1, length(cancer_scores)))
+roc_scores <- c(normal_scores, cancer_scores)  # Combine scores
+
+# 3 Compute ROC Curve
+roc_obj <- roc(roc_labels, roc_scores)
+
+# 4 Find Optimal Threshold Using Youden’s Index
+optimal_idx <- which.max(roc_obj$sensitivities + roc_obj$specificities - 1)
+optimal_threshold <- roc_obj$thresholds[optimal_idx]
+
+# 5 Apply Classification Based on ROC Threshold
+predictions_roc <- ifelse(data_sum$avg_zscore_nuc_peaks >= optimal_threshold, "positive", "negative")
+
+# 6 Create a results dataframe
+results_roc <- data.frame(
+  Sample = data_sum$Sample,
+  avg_zscore_nuc_peaks = data_sum$avg_zscore_nuc_peaks,
+  Predicted_ROC = predictions_roc
+)
+
+# 7 Print threshold and classification counts
+print(paste("Optimal ROC Threshold:", round(optimal_threshold, 2)))
+print(table(predictions_roc))
+
+# 8 Plot ROC Curve
+plot(roc_obj, main = "ROC Curve for Test Classification", col = "blue", lwd = 2)
+abline(v = optimal_threshold, col = "red", lty = 2)  # Mark the ROC threshold
+legend("bottomright", legend = c("ROC Curve", "Optimal Threshold"),
+       col = c("blue", "red"), lty = c(1, 2), lwd = 2)
+
+```
+
+```{r}
+# Merge the two result sets
+final_results <- merge(results_95, results_roc, by = c("Sample", "avg_zscore_nuc_peaks"))
+
+# Print comparison table
+print(final_results)
+
+# Compare classification results
+table(final_results$Predicted_95th_Percentile, final_results$Predicted_ROC)
+
+# Visualize results: Boxplot with both thresholds
+boxplot(data_normal_sum$avg_zscore_nuc_peaks, data_sum$avg_zscore_nuc_peaks,
+        names = c("Normal", "Test Group"),
+        main = "Comparison of 95th Percentile and ROC Thresholds")
+abline(h = threshold_95, col = "red", lty = 2)  # 95th Percentile
+abline(h = optimal_threshold, col = "blue", lty = 2)  # ROC threshold
+legend("topright", legend = c("95th Percentile Threshold", "ROC Threshold"),
+       col = c("red", "blue"), lty = c(2, 2))
+
+```
+```{r}
+# 1️⃣ Merge the two result sets (95th Percentile & ROC)
+final_results <- merge(results_95, results_roc, by = c("Sample", "avg_zscore_nuc_peaks"))
+
+# 2️⃣ Merge with metadata to include `cancer_status` and `Time_to_next_positive`
+final_results <- merge(final_results, metadata[, c("Library Name", "cancer_status", "Time_to_next_positive")], 
+                       by.x = "Sample", by.y = "Library Name", all.x = TRUE)
+
+# 3️⃣ Print the final results table
+print(head(final_results))  # Display the first few rows
+```
+
+```{r}
+# Function to calculate performance metrics
+compute_metrics <- function(conf_matrix) {
+  TP <- conf_matrix["positive", "positive"]
+  TN <- conf_matrix["negative", "negative"]
+  FP <- conf_matrix["positive", "negative"]
+  FN <- conf_matrix["negative", "positive"]
+  
+  # Compute metrics
+  sensitivity <- TP / (TP + FN)  # Recall
+  specificity <- TN / (TN + FP)
+  PPV <- TP / (TP + FP)  # Positive Predictive Value
+  NPV <- TN / (TN + FN)  # Negative Predictive Value
+  
+  return(list(TP = TP, TN = TN, FP = FP, FN = FN,
+              Sensitivity = sensitivity, Specificity = specificity,
+              PPV = PPV, NPV = NPV))
+}
+
+# Compute confusion matrix for 95th Percentile Method
+table_95 <- table(Predicted = final_results$Predicted_95th_Percentile, Actual = final_results$cancer_status)
+metrics_95 <- compute_metrics(table_95)
+
+# Compute confusion matrix for ROC Method
+table_roc <- table(Predicted = final_results$Predicted_ROC, Actual = final_results$cancer_status)
+metrics_roc <- compute_metrics(table_roc)
+
+# Print results for 95th Percentile
+cat("Confusion Matrix for 95th Percentile Method:\n")
+print(table_95)
+cat("\nPerformance Metrics (95th Percentile):\n")
+cat("True Positives (TP):", metrics_95$TP, "\n")
+cat("True Negatives (TN):", metrics_95$TN, "\n")
+cat("False Positives (FP):", metrics_95$FP, "\n")
+cat("False Negatives (FN):", metrics_95$FN, "\n")
+cat("Sensitivity (Recall):", round(metrics_95$Sensitivity, 3), "\n")
+cat("Specificity:", round(metrics_95$Specificity, 3), "\n")
+cat("Positive Predictive Value (PPV):", round(metrics_95$PPV, 3), "\n")
+cat("Negative Predictive Value (NPV):", round(metrics_95$NPV, 3), "\n\n")
+
+# Print results for ROC
+cat("Confusion Matrix for ROC Method:\n")
+print(table_roc)
+cat("\nPerformance Metrics (ROC):\n")
+cat("True Positives (TP):", metrics_roc$TP, "\n")
+cat("True Negatives (TN):", metrics_roc$TN, "\n")
+cat("False Positives (FP):", metrics_roc$FP, "\n")
+cat("False Negatives (FN):", metrics_roc$FN, "\n")
+cat("Sensitivity (Recall):", round(metrics_roc$Sensitivity, 3), "\n")
+cat("Specificity:", round(metrics_roc$Specificity, 3), "\n")
+cat("Positive Predictive Value (PPV):", round(metrics_roc$PPV, 3), "\n")
+cat("Negative Predictive Value (NPV):", round(metrics_roc$NPV, 3), "\n")
+```
+
+
+```{r}
+z_score_nuc_peak <- data_sum[,c("Sample", "avg_zscore_nuc_peaks")]
+# change 
+
+z_score_nuc_peak_normal <- data_normal_sum[,c("Sample", "avg_zscore_nuc_peaks")]
+```
+
+
+```{r}
+write.csv(z_score_nuc_peak, file = file.path(outdir, paste0("02_processing_nucleosome_peaks_cancer_scores.csv")), row.names = FALSE)
+
+write.csv(z_score_nuc_peak_normal, file = file.path(outdir, paste0("02_processing_nucleosome_peaks_control_scores.csv")), row.names = FALSE)
+```
+
+
+

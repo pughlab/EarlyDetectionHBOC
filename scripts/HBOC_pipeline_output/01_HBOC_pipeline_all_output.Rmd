@@ -1,0 +1,362 @@
+---
+title: "HBOC Pipeline Output"
+params:
+  which_project: "HBOC"
+output: html_document
+---
+
+```{r}
+# script by Erik Ensminger, Pugh Lab
+library(matrixStats)
+library(tidyverse)
+library(dplyr)
+library(matrixStats)
+library(reshape2)
+library(ggh4x)
+library(ggpubr) 
+library(RColorBrewer)
+library(readxl)
+library(here)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+# outdir 
+outdir <- here::here("data", "HBOC_pipeline_output")
+date <- Sys.Date();
+```
+
+### PREPARE SESSION
+```{r}
+### PREPARE SESSION ################################################################
+
+which_project <- params$which_project
+
+if (which_project == "control") {
+  outdir <- file.path(outdir, "control")
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  project_output <- file.path(outdir, "control_")
+  
+  # Use organized outputs instead of raw file list
+  organized_dir <- 
+    here::here("raw_data", "HBOC_pipeline_output", "HBC_organized_outputs")
+  
+  # List all files in organized outputs
+  all_files <- list.files(organized_dir, recursive = TRUE, full.names = TRUE)
+  
+} else if (which_project == "HBOC") {
+  outdir <- file.path(outdir, "HBOC")
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  project_output <- file.path(outdir, "HBOC_")
+  
+  # Use organized outputs instead of raw file list
+  organized_dir <- here::here(
+    "raw_data", "HBOC_pipeline_output", "HBOC_organized_outputs"
+  )
+  
+  # List all files in organized outputs
+  all_files <- list.files(organized_dir, recursive = TRUE, full.names = TRUE)
+}
+
+# Check directories and files
+print(outdir)
+print(project_output)
+cat("Number of files found:", length(all_files), "\n")
+head(all_files)
+```
+### Define Functions 
+```{r}
+### FUNCTIONS ######################################################################################
+# function to generate a standardized filename (without date)
+generate.filename <- function(project.stem, file.core, extension) {
+  # build up the filename
+  file.name <- paste(project.stem, file.core, sep = '')
+  file.name <- paste(file.name, extension, sep = '.')
+  return(file.name)
+}
+
+# function to write session profile to file
+save.session.profile <- function(file.name) {
+  sink(file = file.name, split = FALSE)
+  cat('### MEMORY USAGE ###############################################################\n')
+  print(proc.time())
+  cat("\n### SESSION INFO ###############################################################\n")
+  print(sessionInfo())
+  sink()
+}
+```
+
+
+# READ DATA
+```{r}
+### READ DATA ######################################################################################
+# all_files already contains full paths from the organized outputs
+cat("Number of files found:", length(all_files), "\n")
+
+# Helper function to extract files by pattern
+extract_files <- function(pattern) {
+  grep(pattern, all_files, value = TRUE)
+}
+
+# Extract files based on patterns
+score.files        <- extract_files('score.txt$')
+insertsize.files   <- extract_files('picard.txt$')
+fs.ratio.files     <- extract_files('5Mb_bins.txt$')
+nucleosome.files   <- extract_files('peak_distance.txt$')
+
+# Optional: comment these out 
+# motif.files       <- extract_files('motifs.txt$')
+# motif.5.files     <- extract_files('5prime_motifs.txt$')
+# motif.3.files     <- extract_files('3prime_motifs.txt$')
+# breakpoint.files  <- extract_files('frequency.txt$')
+# dinucleotide.long <- extract_files('len167_contexts.txt$')
+# dinucleotide.short<- extract_files('len150_contexts.txt$')
+
+# Check counts
+cat("Score files:", length(score.files), "\n")
+cat("Insert size files:", length(insertsize.files), "\n")
+cat("FS ratio files:", length(fs.ratio.files), "\n")
+cat("Nucleosome files:", length(nucleosome.files), "\n")
+```
+
+
+```{r}
+if (length(score.files) > 0) {
+	score.data <- do.call(rbind, lapply(score.files, function(i) {
+		tmp <- read.delim(i);
+		tmp$Sample <- sub('_score.txt','',basename(i));
+		if (grepl('downsample', basename(i))) {
+			tmp$Sample <- gsub('.downsample','',tmp$Sample);
+			}
+		return(tmp);
+		}));
+
+	colnames(score.data)[1] <- 'FS';
+	}
+
+# read in insert sizes
+if (length(insertsize.files) > 0) {
+	fragment.length.data <- do.call(rbind, lapply(insertsize.files, function(i) {
+		tmp <- read.delim(i, skip = 6, nrow = 1);
+		tmp$Sample <- sub('_picard.txt','',basename(i));
+		if (grepl('downsample', basename(i))) {
+			tmp$Sample <- gsub('.downsample','',tmp$Sample);
+			}
+		return(tmp);
+		}));
+
+	insertsizes.data <- do.call(rbind, lapply(insertsize.files, function(i) {
+		tmp <- read.delim(i, skip = 12);
+		tmp$Sample <- sub('_picard.txt','',basename(i));
+		if (grepl('downsample', basename(i))) {
+			tmp$Sample <- gsub('.downsample','',tmp$Sample);
+			}
+		return(tmp);
+		}));
+	}
+
+# read in fragment ratios
+if (length(fs.ratio.files) > 0) {
+	ratio.data <- do.call(rbind, lapply(fs.ratio.files, function(i) {
+		tmp <- read.delim(i);
+		if (grepl('downsample', basename(i))) {
+			tmp$sample_id <- sub('.downsample','',tmp$sample_id);
+			}
+		return(tmp[,c('sample_id','bin','seqnames','arm','start','end','ratio_centered')]);
+		}));
+	}
+
+# read in nucleosome positioning data
+if (length(nucleosome.files) > 0) {
+	nucleosome.data <- do.call(rbind, lapply(nucleosome.files, function(i) {
+		tmp <- read.delim(i);
+		tmp$Sample <- sub('_peak_distance.txt', '', basename(i));
+		if (grepl('downsample', basename(i))) {
+			tmp$Sample <- sub('.downsample','',tmp$Sample);
+			}
+		return(tmp);
+		}));
+}
+```
+
+# FORMAT DATA 
+## format insert size data
+```{r}
+### FORMAT DATA ####################################################################################
+## format insert size data
+
+if (length(insertsize.files) > 0) {
+
+	# reshape fragment counts
+	histogram.data <- reshape(insertsizes.data[,c('insert_size','All_Reads.fr_count','Sample')],
+		direction = 'wide',
+		idvar = 'insert_size',
+		timevar = 'Sample'
+		);
+ 	 colnames(histogram.data) <- gsub('All_Reads.fr_count.','',colnames(histogram.data));
+ 	 
+ 	 # this removes the fragment length of size 1, so control and HBOC have the same fragment lengths 
+    histogram.data <- histogram.data[histogram.data$insert_size != 1, ] 
+    ## Calculate fragment frequencies
+    freq <- histogram.data[, -1]
+    sums <- colSums2(as.matrix(freq))
+    freq <- as.data.frame(t((t(freq)/sums)*100))
+    # freq$length <- row.names(freq) this line only works when insert_size starts at 1. 
+    freq$length <- histogram.data$insert_size
+    freq <- freq %>% dplyr::select(length, everything())
+
+	# calculate some size metrics
+	short.frags <- apply(
+		histogram.data[which(histogram.data$insert_size > 10 & histogram.data < 150),-1],
+		2, sum, na.rm = TRUE);
+	normal.frags <- apply(
+		histogram.data[which(histogram.data$insert_size >= 150 & histogram.data < 220),-1],
+		2, sum, na.rm = TRUE);
+	long.frags <- apply(
+		histogram.data[which(histogram.data$insert_size >= 220 & histogram.data < 600),-1],
+		2, sum, na.rm = TRUE);
+	total.frags <- apply(
+		histogram.data[which(histogram.data$insert_size > 10 & histogram.data < 600),-1],
+		2, sum, na.rm = TRUE);
+
+	tmp.metrics <- data.frame(
+		Sample = names(short.frags),
+		Total.Fragments = total.frags,
+		Total.Short = short.frags,
+		Total.Normal = normal.frags,
+		Total.Long = long.frags,
+		Proportion.Short = (short.frags / total.frags),
+		Proportion.Long = (long.frags / total.frags),
+		Ratio.Short.Normal = (short.frags / normal.frags)
+		);
+
+	# add metrics to summary data
+	fragment.size.summary <- merge(
+		fragment.length.data[,c('Sample','MEDIAN_INSERT_SIZE','MEDIAN_ABSOLUTE_DEVIATION','MEAN_INSERT_SIZE','STANDARD_DEVIATION','READ_PAIRS')],
+		tmp.metrics,
+		by = 'Sample'
+		);
+ }
+```
+
+## format fragment ratio frequencies
+```{r}
+## format fragment ratio data
+if (length(fs.ratio.files) > 0) {
+
+	# reshape per-bin ratios
+	ratio.data.wide <- reshape(
+		ratio.data,
+		direction = 'wide',
+		idvar = c('bin','seqnames','arm','start','end'),
+		timevar = 'sample_id'
+		);
+	colnames(ratio.data.wide) <- gsub('ratio_centered.','',colnames(ratio.data.wide));
+	}
+```
+
+### format nucleosome positioning data 
+```{r}
+### Format data
+# Aggregating the values across all chromosomes, excluding 'distance' and 'sample'
+nucleosome.data$aggregate_values <- rowSums(nucleosome.data[, 2:(ncol(nucleosome.data) - 1)])
+
+# Reshaping the data to have a single row for each sample
+# Use a subset of the data to reshape
+subset_data <- nucleosome.data %>% dplyr::select(Sample, aggregate_values, distance)
+nucleosome_reshaped <- subset_data %>% 
+  pivot_wider(names_from = distance, values_from = aggregate_values)
+
+```
+
+
+# SAVE DATA
+```{r}
+### SAVE DATA ######################################################################################
+# save fragment scores
+if (exists('score.data')) {
+
+	write.csv(
+		score.data[,c('Sample','FS')],
+		file = generate.filename(project_output, 'FS_score', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+}
+
+# save insert size frequency 
+if (exists('histogram.data')) {
+	write.csv(
+		histogram.data,
+		file = generate.filename(project_output, 'insert_size_count', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+}
+
+# save insert size frequency 
+if (exists('freq')) {
+
+	write.csv(
+		freq,
+		file = generate.filename(project_output, 'insert_size_frequency', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+}
+
+# save insert size summary
+if (exists('fragment.size.summary')) {
+
+	write.csv(
+		fragment.size.summary,
+		file = generate.filename(project_output, 'insert_size_summary', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+	}
+
+# save per-bin fragment ratios
+if (exists('ratio.data.wide')) {
+
+	write.csv(
+		ratio.data.wide,
+		file = generate.filename(project_output, 'per5Mb_fragment_ratios', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+	}
+
+# save per-chromosome nucleosome position summary
+if (exists('nucleosome.data')) {
+
+	write.csv(
+		nucleosome.data[,c('Sample','distance',paste0('chr',1:22))],
+		file = generate.filename(project_output, 'nucleosome_peak_distances', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+}
+
+# save per-chromosome nucleosome position summary
+if (exists('nucleosome_reshaped')) {
+
+	write.csv(
+		nucleosome_reshaped,
+		file = generate.filename(project_output, 'nucleosome_peak_reshaped', 'csv'),
+		row.names = FALSE,
+		col.names = TRUE,
+		sep = '\t'
+		);
+	}
+
+### SAVE SESSION INFO ##############################################################################
+#save.session.profile(generate.filename('CollectFragmentomics','SessionProfile','txt'));
+```

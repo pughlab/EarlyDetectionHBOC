@@ -1,0 +1,138 @@
+---
+title: "Upset_cohort"
+output: html_document
+date: "2024-12-09"
+---
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+
+```
+
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(readxl)
+library(dplyr)
+library(ComplexHeatmap)
+```
+
+```{r}
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+metadata <- read_excel(metadata_path, sheet="April22")
+```
+
+```{r}
+outdir <- here::here("figures", "cohort") 
+date <- Sys.Date();
+
+# drop the rows with timepoint buffy 
+metadata <- metadata[!(metadata$timepoint %in% c("buffy", "tumour")) & !(is.na(metadata$`Library Name`) & is.na(metadata$TS) & is.na(metadata$cfMeDIP)), ]
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+metadata$TS[metadata$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+metadata$TS[metadata$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+metadata <- metadata[!grepl("T-788-T0", metadata$group_id), ]
+metadata <- metadata[!grepl("T-207-T0", metadata$group_id), ]
+
+# remove cfMeDIP samples 
+metadata  <- metadata[!grepl("LIB-04-0649-T0", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0441-T1", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0024-T2", metadata$group_id), ]
+metadata  <- metadata[!grepl("LIB-04-0131-T0", metadata$group_id), ]
+
+```
+
+```{r}
+# Filter metadata to include only relevant rows
+metadata <- metadata %>%
+  dplyr::filter(!is.na(`TS`) | !is.na(`Library Name`) | !is.na(`cfMeDIP`))
+
+metadata <- metadata %>%
+  dplyr::rename(WGS = `Library Name`, Target = TS, cfMeDIP = cfMeDIP)
+
+# Replace "" with NA in the relevant columns
+metadata$Target[metadata$Target == ""] <- NA
+metadata$WGS[metadata$WGS == ""] <- NA
+metadata$WGS[metadata$cfMeDIP == ""] <- NA
+```
+
+```{r}
+# Create a binary presence/absence matrix
+data_seq <- metadata[, c("group_id", "Target", "WGS", "cfMeDIP")]
+
+
+
+# Convert the data into a binary format
+data_binary <- data.frame(
+  Target = ifelse(!is.na(data_seq$Target), 1, 0),
+  WGS = ifelse(!is.na(data_seq$`WGS`), 1, 0),
+  cfMeDIP = ifelse(!is.na(data_seq$cfMeDIP), 1, 0)
+)
+```
+
+```{r}
+# Create a combination matrix
+m1 <- make_comb_mat(data_binary)
+
+# Check combination sizes
+cs <- comb_size(m1)
+```
+
+```{r}
+# Create and customize the UpSet plot
+# Generate the UpSet plot with set sizes
+UpSet <- UpSet(
+  m1,
+  set_order = c("WGS", "Target", "cfMeDIP"),
+
+  top_annotation = HeatmapAnnotation(
+    "Samples" = anno_barplot(
+      cs,
+      ylim       = c(0, max(cs) * 1.1),
+      border     = FALSE,
+      gp         = gpar(fill = "black"),
+      height     = unit(4, "cm"),
+      axis       = TRUE,
+      axis_param = list(gp = gpar(fontsize = 14))
+    ),
+    annotation_name_gp   = gpar(fontsize = 14),
+    annotation_name_side = "left",
+    annotation_name_rot  = 90
+  ),
+
+  right_annotation = rowAnnotation(
+    "Set size" = anno_barplot(
+      set_size(m1),
+      border     = FALSE,
+      gp         = gpar(fill = "grey"),
+      width      = unit(3, "cm"),
+      axis       = TRUE,
+      axis_param = list(gp = gpar(fontsize = 14))
+    ),
+    annotation_name_gp = gpar(fontsize = 14)
+  ),
+
+  comb_order = order(comb_size(m1), decreasing = TRUE)
+)
+
+pdf(file.path(outdir, "03_figure_cohort_upset_plot.pdf"), width = 6, height = 4)
+ht <- draw(UpSet)
+decorate_annotation("Samples", {
+  grid.text(
+    cs[column_order(ht)],
+    x             = seq_along(cs),
+    y             = unit(cs[column_order(ht)], "native") + unit(2, "pt"),
+    default.units = "native",
+    just          = "bottom",
+    gp            = gpar(fontsize = 15, col = "#404040")
+  )
+})
+dev.off()
+```
+

@@ -1,0 +1,489 @@
+---
+title: "Longitudinal_scores_HBOC"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(ggforce) 
+library(grid)
+library(ggh4x)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("figures", "longitudinal")
+
+scores_path <- here::here("data", "statistics", "04_figures_statistics_numerical_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header=TRUE, check.names=FALSE)
+
+# read in data 
+long_data_path <- here::here("data", "longitudinal", "01_processing_longitudinal_samples.csv")
+long_data <- read.csv(long_data_path, header=TRUE, check.names=FALSE)
+```
+
+```{r}
+# Identify z-score columns in scores_normal
+zscore_cols <- grep("^AverageZScore_", colnames(scores_normal), value = TRUE)
+
+# Calculate cumulative z-score for each normal sample
+scores_normal$cumulative_griffin  <- rowSums(scores_normal[, zscore_cols], na.rm = TRUE)
+```
+
+```{r}
+Nucleosome_peak_cutoff <- quantile(scores_normal$avg_zscore_nuc_peaks, 0.99, na.rm = TRUE)
+Tumour_Fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+fragment_ratio_cutoff <- quantile(scores_normal$fragment_ratio_corr , 0.01, na.rm = TRUE)
+fragment_length_cutoff <- quantile(scores_normal$FS , 0.99, na.rm = TRUE)
+griffin_cutoff <- quantile(scores_normal$cumulative_griffin , 0.01, na.rm = TRUE)
+integrated_ctDNA_score_cutoff <- 0.5 
+```
+
+```{r}
+# Filter LIB_IDs with 3 or more timepoints
+# filtered_libs <- scores %>% group_by(LIB_ID) %>% filter(n() >= 3)
+
+scores$cancer_status <- factor(scores$cancer_status,
+                               levels = c("Negative", "Positive"),
+                               labels = c("Negative", "Positive"))
+
+scores$somatic_mutation <- ifelse(is.na(scores$TS), "NS", scores$Mutation)
+
+scores$somatic_mutation <- ifelse(scores$somatic_mutation == "", "Not Detected",
+                               ifelse(scores$somatic_mutation == "NS", "Not Sequenced", "Somatic Mutation"))
+
+
+```
+
+```{r}
+### Samples to plot
+# cases <- c("LIB-04-0024", "LIB-04-0117", "LIB-04-0088", "LIB-04-0544")
+cases <- c("LIB-04-0401", "LIB-04-0117", "LIB-04-0088", "LIB-04-0451", "LIB-04-0544")
+scores <- scores[scores$LIB_ID %in% cases, ]
+```
+
+```{r}
+# Convert date to a proper format
+scores <- scores %>% mutate(date_of_blood = as.Date(date_of_blood))
+
+# Drop NA LIB_IDs and calculate time difference from first sample per patient
+scores <- scores %>% 
+  dplyr::filter(!is.na(LIB_ID)) %>%
+  dplyr::group_by(LIB_ID) %>% 
+  dplyr::mutate(first_sample_date = min(date_of_blood, na.rm = TRUE),
+         time_diff = as.numeric(difftime(date_of_blood, first_sample_date, units = "days"))/30) %>% 
+  dplyr::ungroup()
+```
+
+```{r}
+source_column <- scores$source
+
+scores <- scores[, c("LIB_ID", "time_diff", "FS", "consensus_griffin", "avg_zscore_nuc_peaks", "somatic_mutation", 
+                     "fragment_ratio_corr", "Tumour.Fraction", "integrated_ctDNA_score", "cancer_status")]
+
+colnames(scores) <- c("LIB_ID", "days", "Fragment Length\nScore", "Consensus Griffin",
+                      "Nucleosome Peak\nScore", "Somatic Mutation", "Fragment Ratio\nScore", "Tumor Fraction", "Integrated Score", "cancer_status")
+
+
+
+scores$Clinical <- NA
+
+data_plot <- reshape2::melt(scores, id = c("LIB_ID", "days", "cancer_status", "Somatic Mutation"))
+
+data_plot <- data_plot[complete.cases(data_plot),]
+
+data_plot$variable <- factor(data_plot$variable, levels = c("Clinical", 
+                                                            "Integrated Score", 
+                                                            "Consensus Griffin", 
+                                                            "Tumor Fraction", 
+                                                            "Nucleosome Peak\nScore", 
+                                                            "Fragment Ratio\nScore", 
+                                                            "Fragment Length\nScore"))
+
+```
+
+
+```{r}
+data_plot$color <- "Negative"
+data_plot$color <- ifelse(data_plot$variable == "Integrated Score" & data_plot$value >= integrated_ctDNA_score_cutoff, "Positive", data_plot$color)
+data_plot$color <- ifelse(data_plot$variable == "Consensus Griffin" & data_plot$value < griffin_cutoff, "Positive", data_plot$color)
+data_plot$color <- ifelse(data_plot$variable == "Tumor Fraction" & data_plot$value >= Tumour_Fraction_cutoff, "Positive", data_plot$color)
+data_plot$color <- ifelse(data_plot$variable == "Nucleosome Peak\nScore" & data_plot$value > Nucleosome_peak_cutoff, "Positive", data_plot$color)
+data_plot$color <- ifelse(data_plot$variable == "Fragment Ratio\nScore" & data_plot$value <= fragment_ratio_cutoff, "Positive", data_plot$color)
+data_plot$color <- ifelse(data_plot$variable == "Fragment Length\nScore" & data_plot$value > fragment_length_cutoff, "Positive", data_plot$color)
+```
+
+```{r}
+data_clinical <- data.frame(LIB_ID = scores$LIB_ID,
+                            days = scores$days,
+                            variable = rep("Clinical", length(scores$days)),   # Assign "Clinical" to all rows
+                            color = source_column, # vector that I stored right before creating data_plot
+                            value = rep(0, length(scores$days)))  # Assign source as color
+
+data_clinical$variable <-  factor(data_clinical$variable, levels = c("Clinical", 
+                                                            "Integrated Score",
+                                                            "Consensus Griffin", 
+                                                            "Tumor Fraction", 
+                                                            "Nucleosome Peak\nScore", 
+                                                            "Fragment Ratio\nScore", 
+                                                            "Fragment Length\nScore"))
+
+```
+
+
+```{r}
+limits <- data.frame(variable = c("Clinical", 
+                                  "Integrated Score",
+                                  "Fragment Length\nScore", 
+                                  "Consensus Griffin", 
+                                  "Tumor Fraction", 
+                                  "Nucleosome Peak\nScore", 
+                                  "Fragment Ratio\nScore"),
+                     limit = c(0, integrated_ctDNA_score_cutoff, fragment_length_cutoff, griffin_cutoff, Tumour_Fraction_cutoff, 
+                               Nucleosome_peak_cutoff, fragment_ratio_cutoff),
+                     type = c("solid", "dashed", "dashed", "dashed", "dashed", "dashed", "dashed" ))
+
+limits$variable <- factor(limits$variable, levels = c("Clinical", 
+                                                      "Integrated Score",
+                                                      "Consensus Griffin", 
+                                                      "Tumor Fraction", 
+                                                      "Nucleosome Peak\nScore", 
+                                                      "Fragment Ratio\nScore", 
+                                                      "Fragment Length\nScore"))
+```
+
+
+```{r}
+# Step 1: Original diagnosis data with labels and days
+data_cancer_diagnosis_raw <- data.frame(
+  LIB_ID = c("LIB-04-0544", "LIB-04-0117", "LIB-04-0088", "LIB-04-0088", "LIB-04-0451", "LIB-04-0401"),
+  days = c(8.344283837, 30.71327201, 29.9934297, 51.60972405, 22.53613666, -41.65571616),
+  label = c("HGOSC\nrecurrence", "HGOSC\nrecurrence", "HGOSC", "HGOSC\nrecurrence", "HGOSC\nrecurrence", "Metastatic\nBreast")
+)
+
+# Step 2: Define facet variables (same as in the plot)
+facet_variables <- c("Clinical", "Integrated Score", "Consensus Griffin", "Tumor Fraction",
+                     "Nucleosome Peak\nScore", "Fragment Ratio\nScore", "Fragment Length\nScore")
+
+# Step 3: Expand across all facet variables
+data_cancer_diagnosis <- tidyr::expand_grid(
+  data_cancer_diagnosis_raw,
+  variable = facet_variables
+)
+
+# Step 4: Set factor levels for proper facet order
+data_cancer_diagnosis$variable <- factor(data_cancer_diagnosis$variable, levels = facet_variables)
+
+# 1. Expanded version for red lines (all rows)
+data_cancer_diagnosis_lines <- tidyr::expand_grid(
+  data_cancer_diagnosis_raw,
+  variable = facet_variables
+)
+data_cancer_diagnosis_lines$variable <- factor(data_cancer_diagnosis_lines$variable, levels = facet_variables)
+
+# 2. Original version for yellow dots/labels (only "Clinical")
+data_cancer_diagnosis_points <- data_cancer_diagnosis_raw
+data_cancer_diagnosis_points$variable <- factor("Clinical", levels = facet_variables)
+```
+
+
+```{r}
+### Make clinical table
+# Step 1: Create the raw imaging data (as you did)
+data_imaging_raw <- data.frame(
+  LIB_ID = c("LIB-04-0401", "LIB-04-0401", "LIB-04-0401", 
+             "LIB-04-0544", "LIB-04-0544", "LIB-04-0544", "LIB-04-0544", 
+             "LIB-04-0451", "LIB-04-0451", # Don't show this patient 
+             "LIB-04-0117", "LIB-04-0117", 
+             "LIB-04-0088","LIB-04-0088","LIB-04-0088","LIB-04-0088" ),
+  value = c(-0.32, 10.38, 17.77266754, # dont need to show 3rd image! 
+            -6.997371879, 6.208935611, 10.51248357, 24.34296978, # don't need to show 1st and 2nd image!  
+            7.4, 22.5, # Don't show this patient 
+            30.91327201,35.31537451, #show both images. 
+            30.81471748, 37.12220762, 50.45992116, 52.75952694) # dont show 4th image. 
+)
+
+# Step 2: Define your facet variables
+facet_variables <- c("Clinical", "Integrated Score", "Consensus Griffin", "Tumor Fraction",
+                     "Nucleosome Peak\nScore", "Fragment Ratio\nScore", "Fragment Length\nScore")
+
+# Step 3: Expand across all facet variables
+data_imaging <- tidyr::expand_grid(
+  data_imaging_raw,
+  variable = facet_variables
+)
+
+# Step 4: Set factor levels for variable (important for facet order!)
+data_imaging$variable <- factor(data_imaging$variable, levels = facet_variables)
+```
+
+```{r}
+# Step 1: Create raw CA-125 data with months_from_baseline as value
+data_ca125_raw <- data.frame(
+  LIB_ID = c("LIB-04-0088", 
+             "LIB-04-0117", "LIB-04-0117", 
+             "LIB-04-0544", "LIB-04-0544", "LIB-04-0544"),
+  value = c(30.22339028, 
+            30.91327201, 34.13272011, 
+            8.245729304, 23.65308804, 28.02233903)
+)
+
+# Step 2: Define facet variables
+facet_variables <- c("Clinical", "Integrated Score", "Consensus Griffin", "Tumor Fraction",
+                     "Nucleosome Peak\nScore", "Fragment Ratio\nScore", "Fragment Length\nScore")
+
+# Step 3: Expand the data across all facet variables
+data_ca125 <- tidyr::expand_grid(
+  data_ca125_raw,
+  variable = facet_variables
+)
+
+# Step 4: Set factor levels for consistent facet ordering
+data_ca125$variable <- factor(data_ca125$variable, levels = facet_variables)
+```
+
+```{r}
+# Define theme
+custom_theme <- theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+                      axis.line = element_line(colour = "black"),
+                      panel.grid.major = element_blank(),
+                      panel.grid.minor = element_blank(),
+                      panel.background = element_blank(),
+                      panel.spacing = unit(1, "lines"),
+                      plot.background = element_blank(),
+                      legend.key = element_rect(fill = "white"),
+                      legend.text = element_text(size = 8),
+                      legend.position = "none",
+                      legend.background = element_blank(),
+                      strip.background = element_blank(),
+                      strip.text = element_text(size = 10),
+                      strip.text.x = element_text(size = 12),
+                      strip.text.y.left = element_text(angle = 0),
+                      strip.placement = "outside",
+                      axis.text = element_text(size = 10),
+                      axis.title = element_text(size = 12),
+                      axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1),
+                      panel.spacing.y = unit(0.4, "lines"))     # Pull "Months from Baseline" upward
+
+```
+
+
+```{r}
+
+
+# Define selected patients
+cases <- unique(data_plot$LIB_ID)
+
+# Loop to plot each patient individually
+for (case in cases) {
+  # Subset data for this patient
+  data_case <- data_plot[data_plot$LIB_ID == case, ]
+  clinical_case <- data_clinical[data_clinical$LIB_ID == case, ]
+  imaging_case <- data_imaging[
+    data_imaging$LIB_ID == case & 
+    data_imaging$variable != "Clinical", 
+  ]
+  diagnosis_case_lines <- data_cancer_diagnosis_lines[
+    data_cancer_diagnosis_lines$LIB_ID == case & 
+    data_cancer_diagnosis_lines$variable != "Clinical", 
+  ]
+  diagnosis_case_points <- data_cancer_diagnosis_points[data_cancer_diagnosis_points$LIB_ID == case, ]
+  ca125_case <- data_ca125[data_ca125$LIB_ID == case & data_ca125$variable != "Clinical", ]
+
+  # Begin plot
+  plot <- ggplot(data_case, aes(days, value)) +
+    # Imaging lines (gray, spanning all facets)
+    geom_vline(data = imaging_case, aes(xintercept = value, linetype = "Imaging"),
+               color = "gray90", size = 1) +
+
+    # Diagnosis lines (red, dashed, all facets)
+    geom_vline(data = diagnosis_case_lines, aes(xintercept = days, linetype = "Cancer Diagnosis"),
+               color = "red", size = 1) +
+
+    # Diagnosis yellow dots (only Clinical)
+    geom_point(data = diagnosis_case_points, aes(x = days, y = 0, fill = "Cancer Diagnosis"),
+               shape = 24, size = 3, color = "black") +
+
+    # Diagnosis labels (only Clinical)
+    geom_label(data = diagnosis_case_points, aes(x = days, y = 0.25, label = label),
+               label.size = NA, fill = NA, size = 3, lineheight = 0.75 ) +
+
+    # Fragmentomics line
+    geom_line(alpha = 1, color = "black", size = 0.5) +
+
+    # Clinical threshold background line (light gray)
+    geom_hline(data = subset(limits, variable == "Clinical"), aes(yintercept = limit),
+               color = "gray90", size = 5, alpha = 0.3) +
+
+    # Other thresholds
+    geom_hline(data = subset(limits, variable != "Clinical"),
+               aes(yintercept = limit, linetype = type, size = type, alpha = type),
+               color = "black") +
+
+    # Clinical point overlay
+    geom_point(data = clinical_case, aes(x = days, y = value, fill = color),
+               shape = 21, size = 5, alpha = 0.8) +
+
+    # Somatic mutation dots
+    geom_point(aes(color = color, shape = `Somatic Mutation`), size = 3) +
+
+    # Black solid line for imaging (repeated to ensure top layer)
+    geom_vline(data = imaging_case, aes(xintercept = value, linetype = "Imaging"),
+               color = "black", size = 1, alpha = 0.25) +
+
+    # Dashed black line for LOD threshold
+    geom_hline(data = subset(limits, variable != "Clinical"),
+               aes(yintercept = limit, linetype = "LOD"), color = "black") +
+
+    # Color, fill, shape scales
+    scale_color_manual(name = "Molecular Status",
+                       values = c("Negative" = "black", "Positive" = "red")) +
+    scale_fill_manual(name = "Clinical Status",
+                      values = c(
+                        "Cancer Negative (Survivor No)" = "#9467bd",
+                        "Cancer Positive (First Positive)" = "#f87544",
+                        "Cancer Positive (Survivor)" = "#f4c842",
+                        "Cancer Negative (Survivor)" = "#1f77b4",
+                        "Cancer Diagnosis" = "grey35"
+                      ),
+                      drop = FALSE) +
+    scale_shape_manual(values = c("Not Sequenced" = 1, "Not Detected" = 19, "Somatic Mutation" = 4)) +
+    scale_linetype_manual(name = "Line Type",
+                          values = c(
+                            LOD = "dashed",
+                            Imaging = "solid",
+                            "Cancer Diagnosis" = "dashed",
+                            "Abnormal CA125" = "solid"
+                          )) +
+    scale_size_manual(values = c(dashed = 0.5, solid = 5), guide = "none") +
+    scale_alpha_manual(values = c(dashed = 0.5, solid = 0.25), guide = "none") +
+    guides(linetype = guide_legend(title = "Line Type")) +
+
+    # Labels and layout
+    xlab("Months from Baseline") +
+    ylab("") +
+    labs(color = "Cancer Status", shape = "Somatic Mutation") +
+
+    # Facets and axis customization
+    facet_grid2(variable ~ LIB_ID, scales = "free", space = "free_x", switch = "y", axes = "y") +
+    facetted_pos_scales(y = list(
+      scale_y_continuous(limits = c(-.05, .6), breaks = NULL),
+      scale_y_continuous(limits = c(0, 1)),
+      scale_y_continuous(limits = c(-120,30)),
+      scale_y_continuous(limits = c(-0.2, 0.8)),
+      scale_y_continuous(limits = c(0, 5.2)),
+      scale_y_continuous(limits = c(0.2, 1)),
+      scale_y_continuous(limits = c(-.6, .5))
+    )) +
+    custom_theme +
+    coord_cartesian(expand = TRUE) +
+    scale_x_continuous(position = "top")
+
+  # Conditionally add CA125 line to plot and legend
+  if (nrow(ca125_case) > 0) {
+    plot <- plot + 
+      geom_vline(data = ca125_case, aes(xintercept = value, linetype = "Abnormal CA125"),
+                 color = "blue", size = 1, alpha = 0.5)
+  }
+
+  # Save and print
+  assign(paste0(case, "_plot"), plot)
+  print(plot)
+}
+```
+
+```{r}
+legend_top <- get_legend(
+  `LIB-04-0088_plot` +
+    theme(legend.position = "top", legend.box = "horizontal") +
+    guides(
+      color = guide_legend("Molecular Status", title.position = "top", ncol = 1),
+      linetype = guide_legend("Line Type", title.position = "top", ncol = 2),
+      shape = guide_legend("Somatic Mutation", title.position = "top", ncol = 1),
+      fill = guide_legend("Clinical Status", title.position = "top", ncol = 2)
+    ) +
+    theme(
+      legend.box.just = "center",
+      legend.text = element_text(size = 9),
+      legend.title = element_text(size = 10),
+      legend.key.size = unit(0.5, "cm"),
+      legend.spacing.x = unit(0.7, "cm")
+    )
+)
+```
+
+```{r}
+`LIB-04-0401_clean` <- `LIB-04-0401_plot` + 
+  theme(legend.position = "none", plot.margin = unit(c(0.2, 0.1, 0.4, 0.2), "cm")) + 
+  coord_cartesian(xlim = c(-47, NA), expand = TRUE)  # Extend left
+
+`LIB-04-0544_clean` <- `LIB-04-0544_plot` + 
+  theme(strip.text.y = element_text(size = 0),
+        axis.text.y = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(0.2, -0.2, 0.4, 0.05), "cm"))
+
+`LIB-04-0117_clean` <- `LIB-04-0117_plot` + 
+  theme(strip.text.y = element_text(size = 0),
+        axis.text.y = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(0.2, -0.1, 0.4, -0.2), "cm"))
+
+`LIB-04-0088_clean` <- `LIB-04-0088_plot` + 
+  theme(strip.text.y = element_text(size = 0),
+        axis.text.y = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(0.2, 0.3, 0.4, -0.2), "cm")) +
+  coord_cartesian(xlim = c(NA, 55), expand = TRUE)  # Extend right
+```
+
+
+```{r}
+# blank_spacer <- rectGrob(gp = gpar(col = NA))  # invisible box
+
+main_plot <- grid.arrange(
+  arrangeGrob(
+    `LIB-04-0401_clean`,
+    `LIB-04-0544_clean`,
+    `LIB-04-0117_clean`,
+    `LIB-04-0088_clean`,
+    widths = c(0.65, 0.4, 0.4, 0.50),  # KEY: more space in blank_spacer, not 0088
+    nrow = 1
+  )
+)
+```
+
+```{r}
+# Add legend on top
+plot <- plot_grid(
+  legend_top,
+  main_plot,
+  ncol = 1,
+  rel_heights = c(0.15, 1)
+)
+```
+
+
+```{r}
+ggsave(file.path(outdir, "02_figure_longitudinal_4_cases.pdf"), plot, width = 15, height = 10, units = "in")
+```

@@ -1,0 +1,280 @@
+#Fragment ratio and proption plots
+Adapted from: https://github.com/pughlab/TGL49_CHARM_LFS_Fragmentomics/blob/main/figure_scripts/fragment_frequency/fragment_frequency_prop.R
+
+### Necessary libraries 
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(tidyr)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())  # project root
+date <- Sys.Date();
+```
+
+### Paths
+```{r}
+# Output directories
+outdir <- here::here("figures", "fragment_length")
+outdir_data <- here::here("data", "fragment_length")
+
+# Input metadata file
+samples_file <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+# Import data
+samples <- read_excel(samples_file, sheet = "April22")
+
+# Remove buffy and tumour samples
+samples <- subset(samples, timepoint != "buffy" & timepoint != "tumour")
+
+# Remove failed samples
+failed_samples <- c("CHARMQ_0788_Pl_T_PG_T-788", "CHARMQ_0207_Pl_T_PG_T-207")
+samples <- samples[!samples$`Library Name` %in% failed_samples, ]
+
+# Control and HBOC frequency files
+normal_freq <- here::here(
+  "data", "HBOC_pipeline_output", "control", "control_insert_size_count.csv"
+)
+frequency <- here::here(
+  "data", "HBOC_pipeline_output", "HBOC", "HBOC_insert_size_count.csv"
+)
+
+# Load frequency data
+data_frequency <- read.csv(frequency, check.names = FALSE)
+data_normal <- read.csv(normal_freq, check.names = FALSE)
+
+# Remove failed samples from data
+data_frequency <- data_frequency[, !colnames(data_frequency) %in% failed_samples]
+
+# Print dataset dimensions
+print(dim(data_frequency))
+print(dim(data_normal))
+```
+
+### Filtering Data  
+```{r}
+# set NA values in frequency table to 0 
+data_frequency[is.na(data_frequency)] <- 0
+row.names(data_frequency) <- data_frequency$length
+
+# only want colums WGS, cancer_status and survivor status 
+data_samples <- samples[,(c("Library Name", "cancer_status", "survivor", "source"))]
+print(dim(data_samples))
+# remove any rows with NA values in WGS column 
+data_samples <- data_samples[!is.na(data_samples$'Library Name'),]
+
+# remove any rows with NA values in cancer_status column 
+data_samples <- data_samples[!is.na(data_samples$cancer_status),]
+data_samples <- data_samples[(data_samples$cancer_status %in% c("positive", "negative")), ]
+print(dim(data_samples))
+
+# common cols
+common_cols <- intersect(colnames(data_frequency), samples$'Library Name')
+# this will give me samples from the data_frequency that are not in the samples. 
+samples_not_in_intersect <- setdiff(common_cols,colnames(data_frequency))
+print(samples_not_in_intersect)
+num_common_cols <- length(common_cols)
+print(num_common_cols)
+
+# some samples have already changed the sample name. Consult with Bernard and Julia on what these are. 
+data_samples <- data_samples[data_samples$'Library Name' %in% colnames(data_frequency), ]
+data_frequency <- data_frequency[ , colnames(data_frequency) %in% data_samples$'Library Name']
+print(dim(data_samples))
+print(dim(data_frequency))
+```
+# Combine control and HBOC frequency data
+```{r}
+# drop insert_size column
+data_normal <- data_normal[!colnames(data_normal) %in% c("insert_size")]
+
+# combine the fragment size information 
+combined_fragment_df <- cbind(data_frequency, data_normal)
+
+# update data_samples dataframe by adding control samples to it. 
+control_samples <- colnames(data_normal)
+
+# Create a data frame with the required values for these control samples
+control_data <- data.frame(
+  'Library Name' = control_samples,
+  'cancer_status' = 'no',
+  'survivor' = 'no',
+  'source' = 'Healthy',
+  check.names = FALSE
+)
+
+control_data <- subset(control_data, !grepl("length", control_data$`Library Name`, ignore.case = TRUE))
+
+# Add the control data to data_samples
+data_samples <- rbind(data_samples, control_data)
+``` 
+
+```{r}
+# Create an empty data frame to store the results
+results_df <- data.frame(
+  `Sub-Nucleosome (10-150)` = numeric(0),
+  `Mono-Nucleosome (151-220)` = numeric(0),
+  `Di-Nucleosome (300-400)` = numeric(0),
+  `Tri-Nucleosome (500-600)` = numeric(0),
+  `10-150/151-220` = numeric(0),
+  `151-220/10-220` = numeric(0),
+  `221-500/10-220` = numeric(0),
+  check.names=FALSE
+)
+
+# Function to sum values within the specified range for a column and add to the results data frame
+sum_range_column <- function(column_name, column) {
+  result_row <- data.frame(
+    `Sub-Nucleosome (10-150)` = sum(column[10:150]) / sum(column[10:599]),
+    `Mono-Nucleosome (151-220)` = sum(column[151:220]) / sum(column[10:599]),
+    `Di-Nucleosome (300-400)` = sum(column[300:400]) / sum(column[10:599]),
+    `Tri-Nucleosome (500-600)` = sum(column[500:599]) / sum(column[10:599]),
+    `10-150/151-220` = sum(column[10:150]) / sum(column[151:220]),
+    `151-220/10-220` = sum(column[151:220]) / sum(column[10:220]),
+    `221-500/10-220` = sum(column[221:500]) / sum(column[10:220]),
+    check.names = FALSE
+  )
+  row.names(result_row) <- column_name  # Set the row name to the column name
+  return(result_row)
+}
+
+# Apply the function to each column in the data frame
+for (col_name in names(combined_fragment_df)) {
+  column <- combined_fragment_df[[col_name]]
+  results_df <- rbind(results_df, sum_range_column(col_name, column))
+}
+
+# Merge the data frames using the first column as the key
+merged_df <- merge(data_samples, results_df, by.x = 1, by.y = "row.names")
+# Remove the "Score" column
+merged_df <- subset(merged_df, select = c(-survivor, -cancer_status))
+```
+
+```{r}
+# drop healthy samples - only doing positive vs. negative. 
+merged_df <- merged_df[merged_df$source != "Healthy", ]
+```
+
+```{r}
+merged_df$source<- factor(merged_df$source,
+                                     levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "Healthy"),
+                                     labels = c("Cancer Positive", "Cancer Positive", "Cancer Negative", "Cancer Negative", "Healthy"))
+```
+
+
+```{r}
+# Assuming your data frame is named 'df'
+df_long <- merged_df %>%
+  pivot_longer(
+    cols = -c(`Library Name`, source),
+    names_to = "ratio_type",
+    values_to = "Value"
+  )
+```
+
+# Plotting Fragment Proportions
+```{r}
+df_long_proportions <- df_long %>%
+  dplyr::filter(ratio_type %in% c("Sub-Nucleosome (10-150)", "Mono-Nucleosome (151-220)", "Di-Nucleosome (300-400)", "Tri-Nucleosome (500-600)"))
+```
+
+# Calculate stats
+```{r}
+# diag == source, variable == Colu
+### Calculate stats
+
+data_stats_proportions <- df_long_proportions %>%
+  group_by(source, ratio_type) %>%
+  dplyr::summarise(mean = mean(Value),
+            sd = sd(Value),
+            N = n(),
+            .groups = "keep")
+
+patients <- unique(data_stats_proportions$source)
+sizes <- unique(data_stats_proportions$ratio_type)
+t_test <- c()
+for (patient in patients) {
+  for (size in sizes) {
+    a <- t.test(df_long_proportions$Value[df_long_proportions$source == "Cancer Positive" & df_long_proportions$ratio_type == size], df_long_proportions$Value[df_long_proportions$source == patient & df_long_proportions$ratio_type == size])$p.value
+    t_test <- c(t_test, a)
+  }
+}
+data_stats_proportions$pvalue <- t_test
+data_stats_proportions$annot <- ifelse(data_stats_proportions$pvalue < 0.05 & data_stats_proportions$pvalue > 0.01, "*",
+                           ifelse(data_stats_proportions$pvalue < 0.01 & data_stats_proportions$pvalue > 0.001, "**",
+                                  ifelse(data_stats_proportions$pvalue < 0.001, "***", "")))
+
+### Set limits
+data_stats_proportions$max <- ifelse(data_stats_proportions$ratio_type == "Sub-Nucleosome (10-150)", .92,
+                         ifelse(data_stats_proportions$ratio_type == "Di-Nucleosome (151-220)", .92, .92))
+data_stats_proportions$min <- ifelse(data_stats_proportions$ratio_type == "Mono-Nucleosome (300-400)", -.02,
+                         ifelse(data_stats_proportions$ratio_type == "Tri-Nucleosome (500-600)", -.02, -.02))
+```
+
+
+
+```{r}
+theme <- theme(plot.title = element_text(hjust = 0.5, size = 18), 
+               axis.title = element_text(size = 14),
+               axis.line = element_line(colour = "black"),
+               axis.text = element_text(size = 13),
+               axis.text.x = element_blank(),
+               legend.position = "right",
+               legend.text = element_text(size = 13),
+               axis.title.x = element_text(size = 14),
+                axis.title.y = element_text(size = 14),
+               panel.background = element_blank(),
+               strip.background = element_blank(),
+               strip.text = element_text(size = 13),
+               panel.grid.major = element_line(colour = "grey", size = 0.4, linetype = "dotted"), # Major grid lines
+               )
+```
+
+
+
+```{r}
+df_long_proportions$ratio_type <- factor(df_long_proportions$ratio_type, 
+                                         levels = c("Sub-Nucleosome (10-150)", 
+                                                    "Mono-Nucleosome (151-220)", 
+                                                    "Di-Nucleosome (300-400)", 
+                                                    "Tri-Nucleosome (500-600)"))
+
+data_stats_proportions$ratio_type <- factor(data_stats_proportions$ratio_type, 
+                                         levels = c("Sub-Nucleosome (10-150)", 
+                                                    "Mono-Nucleosome (151-220)", 
+                                                    "Di-Nucleosome (300-400)", 
+                                                    "Tri-Nucleosome (500-600)"))
+```
+
+```{r}
+# Reorder the levels in the 'Column' variable
+#df_long$Column <- factor(df_long$Column, levels = c("10-150/151-220", "151-220/10-220", "221-500/10-220"))
+
+# Create the boxplot
+plot_proportions2 <- ggplot(df_long_proportions, aes(x = source, y = Value, fill = source)) +
+  geom_violin(position = position_dodge(width = 0.75), alpha = 0.5) + 
+  geom_text(data = data_stats_proportions, aes(source, max, label = annot), size = 5) +
+  geom_text(data = data_stats_proportions, aes(source, min, label = N), size = 4) +
+  # geom_point() +
+  geom_boxplot(width=0.2) + 
+  #stat_summary(fun.y=mean, geom="point", size=2, color="red") + 
+  ggtitle("Fragment Size Proportions By Cancer Status") + 
+  xlab("Cancer Status") + 
+  ylab("Proportion of Fragments") +
+  theme + 
+  facet_wrap(.~ratio_type, scales = "fixed", ncol=4) +
+  scale_fill_manual(values = c("Cancer Positive" = "red", "Cancer Negative" = "gray"))
+
+plot_proportions2
+
+ggsave(file.path(outdir, "02_figure_fragment_length_proptions_mono_di_tri_pos_vs_neg.pdf"), plot_proportions2,  width = 14, height = 5)
+write.csv(data_stats_proportions, file = file.path(outdir_data, "02_figure_fragment_length_proptions_mono_di_tri_pos_vs_neg_stats.csv"), row.names = FALSE)
+```

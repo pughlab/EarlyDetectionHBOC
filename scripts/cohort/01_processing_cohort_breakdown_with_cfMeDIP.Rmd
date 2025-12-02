@@ -1,0 +1,230 @@
+---
+title: "01_proessing_cohort_breakdown_with_cfMeDIP"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(readxl)
+library(glue)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+
+samples <- samples[!( 
+  (is.na(samples$`Library Name`) | samples$`Library Name` == "") & 
+  (is.na(samples$TS) | samples$TS == "") & 
+  (is.na(samples$cfMeDIP) | samples$cfMeDIP == "") 
+), ]
+
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+samples$TS[samples$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+samples$TS[samples$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+samples$TS[samples$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+samples$TS[samples$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+# remove cfMeDIP samples 
+samples <- samples[!grepl("LIB-04-0649-T0", samples$group_id), ]
+samples <- samples[!grepl("LIB-04-0441-T1", samples$group_id), ]
+samples <- samples[!grepl("LIB-04-0024-T2", samples$group_id), ]
+samples <- samples[!grepl("LIB-04-0131-T0", samples$group_id), ]
+
+```
+
+```{r}
+# Keep only the selected columns
+samples <- samples[, c("group_id", "LIB_ID", "timepoint", "Library Name", "TS", "cfMeDIP", "date_of_blood", "age_at_blood", "cancer_status", "source", "gene", "sex")]
+head(samples)
+```
+
+```{r}
+# --- BRCA1/2 carrier counts ---
+samples$gene[samples$LIB_ID == "LIB-04-0764" & samples$gene == "UNK"] <- "BRCA1"
+
+n_patients <- n_distinct(samples$LIB_ID)
+
+gene_summary <- samples %>%
+  distinct(LIB_ID, gene) %>%
+  group_by(LIB_ID) %>%
+  summarise(gene_combo = paste(sort(unique(gene)), collapse = "/")) %>%
+  pull(gene_combo)
+
+brca1 <- sum(gene_summary == "BRCA1")
+brca2 <- sum(gene_summary == "BRCA2")
+both <- sum(gene_summary == "BRCA1/BRCA2")
+unknown <- sum(gene_summary == "UNK")
+
+# --- Age summary (per blood sample) ---
+age_values <- samples %>%
+  distinct(group_id, age_at_blood) %>%
+  dplyr::filter(!is.na(age_at_blood)) %>%
+  pull(age_at_blood)
+
+age_min <- min(age_values)
+age_max <- max(age_values)
+age_median <- round(median(age_values))
+age_sd <- round(sd(age_values), 1)
+
+# --- Total blood samples ---
+n_samples <- n_distinct(samples$group_id)
+
+# --- Sex counts ---
+sex_per_patient <- samples %>%
+  distinct(LIB_ID, sex)
+
+n_males <- sum(sex_per_patient$sex == "male")
+male_samples <- samples %>% dplyr::filter(sex == "male") %>% nrow()
+
+n_females <- sum(sex_per_patient$sex == "female")
+female_samples <- samples %>% dplyr::filter(sex == "female") %>% nrow()
+
+# --- Cancer categories ---
+categories <- c(
+  "first_positive_survivor_no" = "CP-FP",
+  "cancer_status_positive_survivor_yes" = "CP-S",
+  "cancer_status_negative_survivor_no" = "CN-SN",
+  "cancer_status_negative_survivor_yes" = "CN-S"
+)
+
+category_summary <- samples %>%
+  group_by(source) %>%
+  dplyr::summarise(individuals = n_distinct(LIB_ID), samples = n()) %>%
+  mutate(category = categories[source])
+
+# --- Serial sample stats ---
+samples_per_patient <- samples %>%
+  dplyr::count(LIB_ID)
+
+median_samples <- median(samples_per_patient$n)
+range_samples <- range(samples_per_patient$n)
+n_serial <- sum(samples_per_patient$n > 1)
+n_single <- sum(samples_per_patient$n == 1)
+
+sample_distribution <- samples_per_patient %>%
+  dplyr::count(n) %>%
+  arrange(n)
+
+sample_dist_text <- paste0(sample_distribution$n, " sample(s): ", sample_distribution$nn, " patient(s)", collapse = "; ")
+
+# --- Cancer-positive/negative samples ---
+n_pos_samples <- sum(samples$cancer_status == "positive")
+n_neg_samples <- sum(samples$cancer_status == "negative")
+
+# --- Sequencing protocol summary (with cfMeDIP) ---
+samples <- samples %>%
+  mutate(
+    has_WGS = !is.na(`Library Name`) & `Library Name` != "",
+    has_TS = !is.na(TS) & TS != "",
+    has_cfMeDIP = !is.na(cfMeDIP) & cfMeDIP != ""
+  )
+
+n_all_three <- sum(samples$has_WGS & samples$has_TS & samples$has_cfMeDIP)
+n_wgs_TS <- sum(samples$has_WGS & samples$has_TS & !samples$has_cfMeDIP)
+n_ts_cfmedip <- sum(!samples$has_WGS & samples$has_TS & samples$has_cfMeDIP)
+n_wgs_cfmedip <- sum(samples$has_WGS & !samples$has_TS & samples$has_cfMeDIP)
+n_wgs_only <- sum(samples$has_WGS & !samples$has_TS & !samples$has_cfMeDIP)
+n_cfmedip_only <- sum(!samples$has_WGS & !samples$has_TS & samples$has_cfMeDIP)
+n_ts_only <- sum(!samples$has_WGS & samples$has_TS & !samples$has_cfMeDIP)
+
+# --- Output paragraph ---
+cat(glue("
+Blood samples from {n_patients} BRCA1/2m-carriers (age range = {age_min}-{age_max}, median age = {age_median}, sd = {age_sd}, BRCA1 germline = {brca1}, BRCA2 germline = {brca2}, both BRCA1 and BRCA2 germline = {both}, unknown BRCA1/2 status = {unknown}) were collected, comprising a total of {n_samples} blood samples.
+
+Male BRCA1/2m-carriers (n={n_males}, samples = {male_samples}) were found to be disproportionately less represented within the cohort compared with females (n={n_females}, samples = {female_samples}).
+
+BRCA1/2m-carrier samples were classified into 4 categories:
+(i) Cancer Positive (First Positive) [CP-FP], individuals = {category_summary$individuals[category_summary$category == 'CP-FP']}, samples = {category_summary$samples[category_summary$category == 'CP-FP']};
+(ii) Cancer Positive (Survivor) [CP-S], individuals = {category_summary$individuals[category_summary$category == 'CP-S']}, samples = {category_summary$samples[category_summary$category == 'CP-S']};
+(iii) Cancer Negative (Survivor No) [CN-SN], individuals = {category_summary$individuals[category_summary$category == 'CN-SN']}, samples = {category_summary$samples[category_summary$category == 'CN-SN']};
+(iv) Cancer Negative (Survivor) [CN-S], individuals = {category_summary$individuals[category_summary$category == 'CN-S']}, samples = {category_summary$samples[category_summary$category == 'CN-S']}.
+
+A median of {median_samples} serial blood samples (range = {range_samples[1]} - {range_samples[2]}) were collected from {n_serial} BRCA1/2m-carriers, with the remaining {n_single} BRCA1/2m-carriers only having one blood sample collected.
+Sample distribution across carriers: {sample_dist_text}.
+
+A total of {n_neg_samples} cancer-negative (from CN-SN and CN-S) and {n_pos_samples} cancer-positive (from CP-FP and CP-S) samples were collected.
+
+Out of all samples:
+- {n_all_three} had all three sequencing protocols (WGS, TS, and cfMeDIP),
+- {n_ts_cfmedip} had TS and cfMeDIP only,
+- {n_wgs_cfmedip} had WGS and cfMeDIP only,
+- {n_ts_only} had TS only,
+- {n_wgs_only} had WGS only,
+- {n_cfmedip_only} had cfMeDIP only.
+- {n_wgs_TS} had TS and WGS only
+"))
+```
+
+```{r}
+library(dplyr)
+library(glue)
+
+# Step 1: Prepare status vectors per patient, ordered by timepoint
+pheno_status <- samples %>%
+  arrange(LIB_ID, as.numeric(timepoint)) %>%
+  group_by(LIB_ID) %>%
+  summarise(
+    status_vec = list(cancer_status),
+    status_str = paste(cancer_status, collapse = " → ")
+  ) %>%
+  rowwise() %>%
+  mutate(
+    transitions = list(rle(unlist(status_vec))$values),
+    pos_indices = list(which(unlist(transitions) == "positive")),
+    is_multiple = length(unlist(pos_indices)) >= 2 && any(diff(unlist(pos_indices)) > 1),
+    is_forward = any(unlist(transitions) == "negative") &&
+                 any(unlist(transitions) == "positive") &&
+                 match("negative", unlist(transitions)) < match("positive", unlist(transitions)) &&
+                 !is_multiple,
+    is_reverse = any(unlist(transitions) == "positive") &&
+                 any(unlist(transitions) == "negative") &&
+                 match("positive", unlist(transitions)) < match("negative", unlist(transitions)) &&
+                 !is_multiple
+  )
+
+# Step 2: Summarize counts
+n_forward <- sum(pheno_status$is_forward)
+n_reverse <- sum(pheno_status$is_reverse)
+n_multiple <- sum(pheno_status$is_multiple)
+n_total_pheno <- n_forward + n_reverse + n_multiple
+
+# Step 3: Output phenoconverter paragraph
+cat(glue("
+{n_total_pheno} BRCA1/2m-carriers, termed “phenoconverters” (Figure 1B), transitioned from cancer-negative to cancer-positive (forward; n={n_forward}), cancer-positive to cancer-negative (reverse, n={n_reverse}), or developed multiple cancers (n={n_multiple}).
+"))
+
+# Step 4: Print LIB_IDs of true multiple cancer patients
+cat("\nPatients with multiple cancer events:\n")
+print(pheno_status$LIB_ID[pheno_status$is_multiple])
+```
+
+```{r}
+# --- Time between first and last blood draw for patients with ≥2 samples ---
+time_summary <- samples %>%
+  dplyr::filter(!is.na(date_of_blood)) %>%
+  group_by(LIB_ID) %>%
+  dplyr::filter(n_distinct(group_id) >= 2) %>%
+  summarise(
+    first_date = min(date_of_blood),
+    last_date = max(date_of_blood),
+    months_between = as.numeric(difftime(last_date, first_date, units = "days")) / 30.44
+  )
+
+# Median and range
+median_months <- round(median(time_summary$months_between), 1)
+range_months <- round(range(time_summary$months_between), 1)
+
+cat(glue("
+Among BRCA1/2m-carriers with serial blood samples, the median time between first and last blood draw was {median_months} months (range = {range_months[1]} - {range_months[2]} months).
+"))
+```

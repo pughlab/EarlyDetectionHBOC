@@ -1,0 +1,414 @@
+---
+title: "06_figure_griffin_scoring_heatmap_matched_cancer_to_publish"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("figures", "griffin")
+
+# read in data 
+scores_path <- here::here("data", "griffin", "05_processing_griffin_nucleosome_accesibility_all_cancer_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+scores <- scores[!grepl("CHARMQ_0788_Pl_T_PG_T-788", scores$Patient), ]
+scores <- scores[!grepl("CHARMQ_0207_Pl_T_PG_T-207", scores$Patient), ]
+
+scores_normal_path <- here::here("data", "griffin", "05_processing_griffin_nucleosome_accesibility_all_normal_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header=TRUE, check.names=FALSE)
+
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+
+# remove failed samples 
+samples <- samples[!grepl("CHARMQ_0788_Pl_T_PG_T-788", samples$`Library Name`), ]
+samples <- samples[!grepl("CHARMQ_0207_Pl_T_PG_T-207", samples$`Library Name`), ]
+
+```
+
+```{r}
+patients <- unique(scores_normal$Patient)
+# Extract unique patient names from scores_normal
+new_samples <- data.frame(
+  group_id = patients,
+  source = "Healthy",
+  cancer_status = "negative",
+  `Library Name` = patients, 
+  stringsAsFactors = FALSE, 
+  check.names = FALSE
+)
+
+# Ensure `new_samples` has the same columns as `samples`
+# Fill other columns with NA if they exist in `samples` but not in `new_samples`
+missing_columns <- setdiff(names(samples), names(new_samples))
+new_samples[missing_columns] <- NA
+
+# Reorder columns to match `samples`
+new_samples <- new_samples[names(samples)]
+
+# Combine existing samples with new healthy samples
+samples <- rbind(samples, new_samples)
+
+```
+
+```{r}
+# Rename columns in scores_normal, except "Patient"
+colnames(scores_normal) <- gsub("^Normal", "", colnames(scores_normal))
+
+# Make sure the column order and names match exactly
+scores_normal <- scores_normal[, colnames(scores)]
+# Combine both dataframes
+scores <- rbind(scores, scores_normal)
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+
+# group ovarian cancers into "ovarian" 
+samples$cancer_type[grepl("hgsoc", samples$cancer_type)] <- "ovarian"
+
+
+samples <- samples[!(is.na(samples$`Library Name`) | samples$`Library Name` == ""), ]
+samples$TS[samples$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+samples$TS[samples$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+samples$TS[samples$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+samples$TS[samples$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+```
+
+```{r}
+data <- merge(
+  samples, 
+  scores, 
+  by.x = c("Library Name"), # Only common columns
+  by.y = c("Patient"),
+  all.y = TRUE
+)
+
+# data <- data %>% select(group_id, LIB_ID, `Library Name`, TS, cfMeDIP, everything())
+```
+
+
+```{r}
+zscore_cols <- grep("^AverageZScore_", colnames(scores_normal), value = TRUE)
+
+griffin_cutoffs <- sapply(zscore_cols, function(col) {
+  quantile(scores_normal[[col]], 0.01, na.rm = TRUE)
+})
+
+names(griffin_cutoffs) <- gsub("^AverageZScore_", "AverageZScore_", zscore_cols)
+
+for (col in names(griffin_cutoffs)) {
+    if (col %in% colnames(data)) {
+        cutoff <- griffin_cutoffs[col]
+
+        # extract the cancer type from the column name
+        cancer_label <- gsub("^AverageZScore_", "", col)
+
+        data[[col]] <- ifelse(
+            data[[col]] < cutoff & !is.na(data$cancer_type) & data$cancer_type == cancer_label,
+            "pos_match",
+            ifelse(data[[col]] < cutoff, "pos", "neg")
+        )
+        
+        # handle missing library names
+        data[[col]][is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+    }
+}
+
+data$consensus_griffin <- apply(data[, zscore_cols], 1, function(row) {
+  sum(row == "pos", na.rm = TRUE)
+})
+```
+
+```{r}
+data$source <- factor(data$source, levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "Healthy"),
+                             labels = c("Cancer Positive\n(First Positive)", "Cancer Positive\n(Survivor)", "Cancer Negative\n(Survivor No)", "Cancer Negative\n(Survivor)", "Healthy"))
+
+data$cancer_status <- factor(data$cancer_status, levels = c("positive", "negative", ""),
+                                      labels = c("Positive", "Negative", "NA"))
+
+data$cancer_type <- factor(data$cancer_type, levels=c("ovarian", "breast", "lung", "prostate","liver", "thyroid", "thymoma", "myeloma", "cervical", "endometrial", ""), 
+                           labels=c("Ovarian", "Breast", "Lung", "Prostate", "Liver", "Thyroid", "Thymoma", "Myeloma", "Cervical", "Endometrial", "NA"))
+
+data$survivor <- factor(data$survivor, levels = c("yes", "no", ""),
+                                      labels = c("Yes", "No", "NA"))
+
+data <- data %>%
+  mutate(
+    sorting_value = case_when(
+      months_to_positive == "positive" ~ -1,
+      months_to_positive == "no_future_cancer" ~ Inf,
+      months_to_positive == "UNK" ~ 999,
+      months_to_positive == "pending" ~ 999,
+      TRUE ~ as.numeric(months_to_positive)
+    )
+  ) %>%
+  arrange(source, sorting_value, cancer_type, desc(consensus_griffin), group_id)
+```
+
+```{r}
+sites <- c("OV", "BRCA", "PRAD", "LUAD", "BLCA", "LGG", "ACC", "CESC", "CHOL", "COAD", "ESCA", "GBM", "HNSC", 
+  "KIRC", "KIRP", "LIHC", "LUSC", "MESO", "PCPG", "SKCM", "STAD", "TGCT", "THCA", "UCEC")
+
+names <- c("Ovarian Cancer", "Breast Cancer", "Prostate Cancer", "Lung Adenocarcinoma", "Bladder Cancer", 
+  "Brain Lower Grade Glioma", "Adrenocortical Carcinoma", "Cervical and Endocervical Cancer", 
+  "Cholangiocarcinoma", "Colon Cancer", "Esophageal Cancer", "Glioblastoma", "Head and Neck Cancer", 
+  "Kidney Clear Cell Carcinoma", "Kidney Papillary Cell Carcinoma", "Liver Cancer", 
+  "Lung Squamous Cell Carcinoma", "Mesothelioma", "Pheochromocytoma and Paraganglioma", "Melanoma", 
+  "Stomach Cancer", "Testicular Germ Cell Tumors", "Thyroid Cancer", "Uterine Endometrial Cancer")
+
+lists <- c("ovarian", "breast", "prostate", "lung_adenocarcinoma", "bladder", "brain", "adrenocortical", 
+  "cervical_endocervical", "cholangiocarcinoma", "colon", "esophageal", "glioblastoma", "head_neck", 
+  "kidney_clear_cell", "kidney_papillary_cell", "liver", "lung_squamous_cell", "mesothelioma", 
+  "pheochromocytoma_paraganglioma", "melanoma", "stomach", "testicular_germ_cell", "thyroid", "uterine_endometrial")
+
+```
+
+
+```{r}
+# 1. Create a mapping from sites to pretty names
+site_name_map <- setNames(names, lists)
+
+# 2. Select columns corresponding to `AverageZScore_<site>` from `data`
+zscore_cols <- paste0("AverageZScore_", lists)
+zscore_cols <- zscore_cols[zscore_cols %in% colnames(data)] # Keep only existing columns
+
+# 3. Subset the `data` dataframe to only the selected columns
+data_mutation <- as.matrix(data[, zscore_cols])
+
+# 4. Rename the columns using `site_name_map`
+colnames(data_mutation) <- site_name_map[gsub("^AverageZScore_", "", colnames(data_mutation))]
+# colnames(data_mutation) <- paste0(colnames(data_mutation), " Coverage")
+
+# 5. Set row names as `group_id`
+row.names(data_mutation) <- data$`group_id`
+
+# 6. Transpose the matrix
+data_mutation <- t(data_mutation)
+```
+
+
+```{r}
+col <- c(pos = "#fb9a99", pos_match = "#e31a1c", NS = "grey65")
+
+col_type <- c(Ovarian = "#fd7f6f",  Breast = "#bd7ebe", Cervical = "#7eb0d5", Lung="#8bd3c7",  Prostate="#ebdc78", Liver="#fdcce5", "NA" = "white", Thyroid = "#ffb55a" , Thymoma="#4682b4", Myeloma="#9acd32", Endometrial = "blue")
+
+col_previous <- c(Positive = "#fb9a99", Negative = "grey95", "NA" = "grey95")
+
+col_survivor <- c(Yes = "#fb9a99", No = "grey95", NS = "grey65")
+
+```
+
+```{r}
+# Define the color function for numeric months
+col_months <- colorRamp2(
+  c(3, 6, 12, 24, 36),  # Breakpoints
+  c("black", "darkgrey", "grey", "lightgrey", "white")  # Gradient from black to white
+)
+
+
+col_months_with_categories <- function(x) {
+  if (is.na(x)) {  # If not sequenced
+    return("grey65")  # Assign a color for missing values
+  } else if (x == "no_future_cancer") {  # No cancer expected
+    return("green")
+  } else if (x == "UNK") {  # Unknown
+    return("yellow")
+  } else if (x == "positive") {  # Currently positive
+    return("black")
+  } else if (x == "pending") {  # Currently positive
+    return("blue")
+  } else {  # For numeric values, use the gradient
+    return(col_months(as.numeric(x)))
+  }
+}
+
+# Convert months_to_positive to a named vector for colors
+col_months_vector <- sapply(
+  data$months_to_positive,
+  col_months_with_categories
+)
+```
+
+
+```{r}
+## Set variables
+alter_fun = function(x, y, w, h, v) {
+  # Background: Adjust the size to match the alterations
+  grid.rect(x, y, w * 0.8, h * 0.8, gp = gpar(fill = "grey95", col = NA))  # Match the size of the alteration boxes
+  
+  # Alterations: Adjust width (`w`) and height (`h`) to create space between boxes
+  n = sum(v)  # Number of alterations for the current gene in the current sample
+  
+  if (n) {
+    # Calculate the total height needed for the stack and center it within the background box
+    total_height = (1 / n) * h * 0.8
+    center_offset = h * 0.4  # Adjust to center the stack
+    
+    for (i in 1:n) {
+      # Position each alteration in the stack
+      grid.rect(x, y - center_offset + (i - 0.5) * total_height, w * 0.8, total_height,  # Adjust width and height
+                gp = gpar(fill = col[names(which(v))][i], col = NA), just = "center")
+    }
+  }
+}
+```
+
+
+```{r}
+## Set additional annotations
+# Add `months_from_positive` to the top annotation
+bottom_annotation <- HeatmapAnnotation(
+  "Cancer Status" = data$cancer_status,
+  "Cancer History" = data$survivor,
+  "Cancer Type" = data$cancer_type,
+  "Months to Positive" = anno_simple(
+    data$months_to_positive,
+    col = col_months_vector  # Provide the pre-mapped colors
+  ),
+  #height = unit(2, "inches"),  # Adjust this value to increase the vertical space
+  border = FALSE,
+  annotation_name_side = "left",
+  show_annotation_name = TRUE,
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = 13),
+  col = list(
+    "Cancer Status" = col_previous,
+    "Cancer History" = col_survivor,
+    "Cancer Type" = col_type
+  ),
+  show_legend = TRUE,
+  simple_anno_size = unit(0.4, "cm")
+)
+
+```
+
+
+```{r}
+## Set legend labels
+# Define the legend for months_from_positive
+legend_months <- Legend(
+  title = "Months to Positive",
+  at = c("<3 months", "3 - 6 months", "6-12 months", "12-24 months", "24-36 months", 
+         "no future cancer", "unknown", "positive"),
+  legend_gp = gpar(fill = c("black", "darkgrey", "grey", "lightgrey", "white", 
+                            "green", "yellow", "black")),  # Positive is also white
+  title_gp = gpar(fontsize = 14),
+  labels_gp = gpar(fontsize = 12),
+  grid_height = unit(1, "mm"),
+  nrow = 2, 
+  border = TRUE
+)
+
+# Add this to the existing annotation legends
+annotation_legend <- packLegend(
+  list = list(
+    Legend(title = "Cancer Type",
+           at = c("Ovarian", "Cervical", "Breast", "Lung",
+                   "Prostate", "Liver", "NA", 
+                  "Thyroid", "Thymoma", "Myeloma", "Endometrial"),
+           legend_gp = gpar(fill = c("#fd7f6f","#7eb0d5","#bd7ebe","#8bd3c7",
+                                     "#ebdc78", "#fdcce5", "white",
+                                      "#ffb55a" ,"#4682b4","#9acd32", "blue")),
+           title_gp = gpar(fontsize = 14),
+           labels_gp = gpar(fontsize = 12),
+           grid_height = unit(1, "mm"),
+           nrow = 2),
+    Legend(title = "Detection",
+           at = c("Positive", "Match Cancer Positive", "Negative"),
+           legend_gp = gpar(fill = c("#fb9a99", "#e31a1c", "grey95")),
+           title_gp = gpar(fontsize = 14),
+           labels_gp = gpar(fontsize = 12),
+           grid_height = unit(1, "mm"),
+           nrow = 2),
+    legend_months  # Add the months_from_positive legend
+  ),
+  max_height = unit(6, "inches"),
+  direction = "horizontal"
+)
+
+```
+
+```{r}
+# row_order <- row.names(data_mutation)
+col_order <- colnames(data_mutation)
+
+col_split <- data$source 
+order <- c("Cancer Positive\n(First Positive)", "Cancer Positive\n(Survivor)", "Cancer Negative\n(Survivor No)", "Cancer Negative\n(Survivor)", "Healthy")
+col_split <- factor(col_split, levels = order)
+
+stopifnot(length(col_order) == length(col_split))
+```
+
+```{r}
+## Generate heatmap
+# Convert data_mutation (with "pos"/"neg") to binary presence/absence matrix
+binary_mat <- ifelse(data_mutation == "pos", 1, 0)
+
+# Perform hierarchical clustering on rows
+row_dend <- hclust(dist(binary_mat))
+
+# Pass the row order to oncoPrint
+pdf(file.path(outdir, "06_figure_griffin_scores_heatmap_matched_cancer_to_publish.pdf"), width = 14, height = 6)
+
+oncoPrint <- oncoPrint(
+  data_mutation,
+  alter_fun = alter_fun, 
+  col = col,
+  column_split = col_split,
+  show_heatmap_legend = FALSE,
+  show_pct = FALSE,
+  bottom_annotation = bottom_annotation,
+  top_annotation = NULL,
+  right_annotation = NULL,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 12),
+  column_title_gp = gpar(fontsize = 12),
+  column_order = col_order,
+  row_order = row_dend$order, # Apply the clustered row order
+   # row_order = row_order, 
+  border = FALSE,
+  height = unit(0.43* nrow(data_mutation), "cm"),
+  width = unit(0.115 * ncol(data_mutation), "cm")
+)
+
+draw(oncoPrint, heatmap_legend_list = annotation_legend, show_annotation_legend = FALSE, heatmap_legend_side = "bottom")
+dev.off()
+```

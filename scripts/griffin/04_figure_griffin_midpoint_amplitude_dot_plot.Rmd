@@ -1,0 +1,280 @@
+---
+title: "05_figure_griffin_midpoint_amplitude_dot_plot"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(reshape2)
+library(ggformula)
+library(signal)
+library(matrixStats)
+library(lemon)
+library(ggpubr)
+library(data.table)
+library(readxl)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# Set the root directory for knitting automatically
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+
+```{r}
+### Set paths using here::here
+path_tcga          <- here::here("data", "griffin", "griffin_coverage", "01_processing_griffin_HBOC", "TCGA")
+path_custom        <- here::here("data", "griffin", "griffin_coverage", "01_processing_griffin_HBOC", "custom")
+healthy_path_tcga  <- here::here("data", "griffin", "griffin_coverage", "01_processing_griffin_control", "TCGA")
+healthy_path_custom <- here::here("data", "griffin", "griffin_coverage", "01_processing_griffin_control", "custom")
+
+# Output directory
+outdir <- here::here("figures", "griffin")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+### Read in samples
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+data_samples <- read_excel(samples_path, sheet = "April22")
+
+# Filter out invalid or failed samples
+data_samples <- data_samples[!is.na(data_samples$`Library Name`) & data_samples$`Library Name` != "", ]
+data_samples <- data_samples[!grepl("CHARMQ_0788_Pl_T_PG_T-788|CHARMQ_0207_Pl_T_PG_T-207", data_samples$`Library Name`), ]
+
+# Normalize ovarian labels
+data_samples$cancer_type[data_samples$cancer_type %in% c("hgsoc", "breast, hgsoc", "thyroid, hgsoc")] <- "ovarian"
+
+### Get list of files for both TCGA and custom
+data_griffin <- c(
+  list.files(path_tcga, "features", full.names = TRUE),
+  list.files(path_custom, "features", full.names = TRUE)
+)
+
+data_normal <- c(
+  list.files(healthy_path_tcga, "features", full.names = TRUE),
+  list.files(healthy_path_custom, "features", full.names = TRUE)
+)
+```
+
+```{r}
+### Import data
+datalist_griffin <- lapply(data_griffin, function(x){ read.delim(file = x, check.names=FALSE) })
+data_griffin <- do.call(rbind, datalist_griffin)
+
+datalist_normal <- lapply(data_normal, function(x){ read.delim(file = x) })
+data_normal <- do.call(rbind, datalist_normal)
+
+# Remove 'downsample' from column names
+colnames(data_griffin) <- gsub("_downsample", "", colnames(data_griffin))
+colnames(data_normal) <- gsub("_downsample", "", colnames(data_normal))
+```
+
+```{r}
+### Format griffin data
+row.names(data_griffin) <- data_griffin$features
+data_griffin <- data_griffin[, colnames(data_griffin) %in% data_samples$'Library Name']
+data_griffin <- as.data.frame(t(data_griffin))
+
+row.names(data_normal) <- data_normal$features
+data_normal <- data_normal[, -1]
+data_normal <- as.data.frame(t(data_normal))
+```
+
+```{r}
+# Bind data from data_griffin and data_normal
+data <- bind_rows(data_griffin, data_normal)
+
+# Add 'HBOC' to diag column in data_samples
+data_samples$diag <- "HBOC"
+
+# Create a new dataframe with sample names
+samples <- as.data.frame(row.names(data_normal))
+colnames(samples) <- "Library Name"
+
+# Ensure both dataframes have the same structure before merging
+samples$diag <- "HBC" # Add diag column to 'samples' to match data_samples
+samples$cancer_status <- "HBC"
+samples$source <- "HBC"
+samples <- bind_rows(data_samples, samples)
+
+# Assign "HBC" to rows where diag is NA
+samples$diag[is.na(samples$diag)] <- "HBC"
+```
+
+```{r}
+### Scale midpoint by mean coverage
+data_mid <- data[, colnames(data) %like% "midpoint"]
+data_cov <- data[, colnames(data) %like% "coverage"]
+data_amp <- data[, colnames(data) %like% "amp"]
+data_mid <- (data_mid - data_cov) + 1
+data <- bind_cols(data_mid, data_amp)
+
+```
+
+
+```{r}
+### Melt data
+data$sample <- row.names(data)
+
+data_melt <- reshape2::melt(data, id = "sample")
+data_melt$feature <- gsub(".*_","", data_melt$variable)
+data_melt$site <- gsub("_.*","", data_melt$variable)
+data_melt <- merge(data_melt, samples, by.x = "sample", by.y = "Library Name")
+```
+
+```{r}
+### Factor melt data
+data_melt$cancer_status <- factor(data_melt$cancer_status, levels = c("HBC", "negative", "positive"),
+                                  labels = c("Healthy", "Negative", "Positive"))
+```
+
+
+```{r}
+### Calculate stats
+data_stats <- data_melt %>%
+  group_by(cancer_status, feature, site) %>%
+  dplyr::summarise(mean = mean(value),
+            median = median(value),
+            sd = sd(value),
+            N = n())
+data_stats$variable <- paste0(data_stats$site, "_", data_stats$feature)
+```
+
+
+
+```{r}
+t_test <- c()
+vars <- unique(data_stats$variable)
+for (var in vars) {
+  a <- t.test(data_melt$value[data_melt$cancer_status == "Healthy" & data_melt$variable == var], 
+              data_melt$value[data_melt$cancer_status == "Negative" & data_melt$variable == var])$p.value
+  b <- t.test(data_melt$value[data_melt$cancer_status == "Healthy" & data_melt$variable == var], 
+              data_melt$value[data_melt$cancer_status == "Positive" & data_melt$variable == var])$p.value
+  t_test <- c(t_test, a, b)
+}
+t_test <- p.adjust(t_test, method = "BH")
+data_stats$pvalue <- c(rep(1, length(vars)), t_test)
+data_stats$annot <- ifelse(data_stats$pvalue < 0.05 & data_stats$pvalue > 0.01, "*",
+                               ifelse(data_stats$pvalue < 0.01 & data_stats$pvalue > 0.001, "**",
+                                      ifelse(data_stats$pvalue < 0.001, "***", "")))
+```
+
+```{r}
+### Format plotting tables
+data_melt$feature <- factor(data_melt$feature, levels = c("midpoint", "coverage", "amp"),
+                            labels = c("Midpoint\nCoverage", "Mean\nCoverage", "Amplitude"))
+data_stats$feature <- factor(data_stats$feature, levels = c("midpoint", "coverage", "amp"),
+                             labels = c("Midpoint\nCoverage", "Mean\nCoverage", "Amplitude"))
+data_stats$place <- ifelse(data_stats$feature == "Midpoint\nCoverage", 1.05, 0.7)
+data_stats$place_N <- ifelse(data_stats$feature == "Midpoint\nCoverage", 0.75, 0)
+```
+
+```{r}
+### Make color scheme
+data_melt$color <- data_melt$diag
+data_melt$color <- ifelse(data_melt$site == "ACC" & data_melt$cancer_type == "adrenal", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "BRCA" & data_melt$cancer_type == "breast", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "UCEC" & data_melt$cancer_type == "endometrial", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "LGG" & data_melt$cancer_type %in% c("astrocytoma", "glioma"), "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "PRAD" & data_melt$cancer_type == "prostate", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "LUAD" & data_melt$cancer_type == "lung", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "BLCA" & data_melt$cancer_type == "bladder", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "LUSC" & data_melt$cancer_type == "lung", "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "GBM" & data_melt$cancer_type %in% c("astrocytoma", "glioma"), "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$site == "OV" & data_melt$cancer_type %in% c("hgsoc", "ovarian"), "Matched Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$cancer_status == "Positive" & data_melt$color == "HBOC", "Other Cancer", data_melt$color)
+data_melt$color <- ifelse(data_melt$cancer_status == "Negative" & data_melt$diag == "HBOC", "HBOC Cancer Negative", data_melt$color)
+data_melt$color <- ifelse(data_melt$cancer_status == "Healthy", "HBC", data_melt$color)
+data_melt$color <- factor(data_melt$color, levels = c("HBC", "HBOC Cancer Negative", "Matched Cancer", "Other Cancer"),
+                          labels = c("Healthy Control", "HBOC Cancer Negative", "HBOC Cancer Positive (Matched)", "HBOC Cancer Positive (Other)"))
+```
+
+```{r}
+### Set Theme
+theme <- theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 20), 
+               axis.title = element_text(size = 12),
+               axis.line = element_line(colour = "black"),
+               axis.text.x = element_text(size = 0, angle = 90, hjust = 1, vjust = 0.5),
+               axis.text = element_text(size = 10),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               panel.border = element_blank(),
+               panel.background = element_blank(),
+               panel.spacing.x = unit(0, "lines"),
+               legend.position = "bottom",
+               legend.background = element_rect(fill = "white"),
+               legend.text = element_text(size = 10),
+               legend.key = element_rect(fill = "white"),
+               legend.spacing.y = unit(0, "mm"),
+               legend.key.size = unit(3, "mm"),
+               strip.placement = "outside",
+               strip.background = element_rect(color = NA, fill = NA),
+               strip.text = element_text(face = "bold", size = 8))
+```
+
+```{r}
+### Graph Figure
+data_melt <- data_melt %>%
+  group_by(diag, feature, site) %>%
+  arrange(value)
+site_plot <- ggplot(data_melt, aes(cancer_status, value)) +
+  geom_point(aes(group = cancer_status, color = color), alpha = 0.75,
+             position = position_dodge2(.75), size = 0.5, pch = 16) +
+  geom_text(data = data_stats, aes(x = cancer_status, y = place, label = annot), size = 4) +
+  geom_text(data = data_stats, aes(x = cancer_status, y = place_N, label = N), size = 2) +
+  facet_grid(feature~site, scales = "free", switch = "y") +
+  facet_rep_grid(feature~site, scales = "free", switch = "y") +
+  labs(color = "Diagnosis") +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  xlab("") + 
+  ylab("") +
+  scale_color_manual(values = c("grey65", "black", "red", "blue")) +
+  theme +
+  stat_summary(fun = match.fun(median), geom = "crossbar", size = 0.25, width = 0.75, group = 1, show.legend = FALSE, color = "#FF0000")
+site_plot
+```
+
+```{r}
+ggsave(file.path(outdir, paste0("04_figure_griffin_midpoint_amplitude_plot.pdf")), site_plot, device = "pdf", width = 12, height = 4, units = "in", limitsize = FALSE)
+```
+
+```{r}
+### Plot shorter version
+sites <- c("ACC", "BLCA", "BRCA", "GBM", "LGG", "LUAD", "LUSC", "PRAD", "SKCM", "OV")
+data_melt2 <- data_melt[data_melt$site %in% sites, ]
+data_stats2 <- data_stats[data_stats$site %in% sites, ]
+data_stats2$place <- ifelse(data_stats2$feature == "Midpoint\nCoverage", 1.05, 0.7)
+
+data_melt2 <- data_melt2 %>%
+  group_by(diag, feature, site) %>%
+  arrange(value)
+site_plot2 <- ggplot(data_melt2, aes(cancer_status, value)) +
+  geom_point(aes(group = cancer_status, color = color), alpha = 0.75,
+             position = position_dodge2(.75), size = 0.75, pch = 16) +
+  geom_text(data = data_stats2, aes(x = cancer_status, y = place, label = annot), size = 4) +
+  geom_text(data = data_stats2, aes(x = cancer_status, y = place_N, label = N), size = 2) +
+  facet_grid(feature~site, scales = "free", switch = "y") +
+  facet_rep_grid(feature~site, scales = "free", switch = "y") +
+  labs(color = "Diagnosis") +
+  guides(colour = guide_legend(title.position = "top",
+                               title.hjust = 0.5,
+                               title.vjust = 2,
+                               override.aes = list(size=2))) +
+  xlab("") + 
+  ylab("") +
+  scale_color_manual(values = c("grey65", "black", "red", "blue")) +
+  theme +
+  stat_summary(fun = match.fun(median), geom = "crossbar", size = 0.25, width = 0.75, group = 1, show.legend = FALSE, color = "#FF0000")
+site_plot2
+```
+
+```{r}
+ggsave(file.path(outdir, paste0("04_figure_griffin_midpoint_amplitude_plot_short.pdf")), site_plot2, device = "pdf", width = 8, height = 5, units = "in", limitsize = FALSE)
+```

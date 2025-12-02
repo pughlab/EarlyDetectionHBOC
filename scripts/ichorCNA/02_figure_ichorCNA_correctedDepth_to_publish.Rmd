@@ -1,0 +1,479 @@
+---
+title: "figure_1_ichorCNA"
+output: html_document
+date: "`r Sys.Date()`"
+params: 
+  ichorCNA_estimate_table: "HBOC_ichorCNA_estimates.tsv"
+  HBC_ichorCNA_estimate_table: "HBC_ichorCNA_estimates.tsv"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(data.table)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+
+date <- Sys.Date();
+```
+
+
+
+```{r}
+# Output directories
+outdir <- here::here("figures", "ichorCNA")
+outdir_data <- here::here("data", "ichorCNA")
+
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+if (!dir.exists(outdir_data)) dir.create(outdir_data, recursive = TRUE)
+```
+
+```{r}
+mutations <- read_excel(here::here("./raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+mutations <- mutations[,c("TS", "BRCA1_somatic", "BRCA2_somatic", "vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "TP53", "vaf_TP53", "PALB2", "vaf_PALB2")]
+
+ichorCNA <- read.delim(here::here("raw_data", "ichorCNA", params$ichorCNA_estimate_table))
+ichorCNA <- ichorCNA[!grepl("CHARMQ_0788_Pl_T_PG_T-788", ichorCNA$ID), ]
+ichorCNA <- ichorCNA[!grepl("CHARMQ_0207_Pl_T_PG_T-207", ichorCNA$ID), ]
+
+HBC_ichorCNA <- read.delim(here::here("raw_data", "ichorCNA", params$HBC_ichorCNA_estimate_table))
+tumour_fraction_cutoff <- quantile(HBC_ichorCNA$Tumour.Fraction , 0.99, na.rm = TRUE)
+
+segs <- read.delim(here::here("data", "ichorCNA", "01_processing_ichorCNA_HBOC_segs.txt"))
+colnames(segs) <- gsub("\\.", "-", colnames(segs))
+
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+```
+
+```{r}
+# convert tumour fraction to percent
+ichorCNA$Tumour.Fraction <- ichorCNA$Tumour.Fraction * 100
+
+```
+
+```{r}
+colnames(mutations)[colnames(mutations) == "TS"] <- "sample_ID"
+
+# Create a new column 'vaf' that combines the two columns
+mutations$vaf <- ifelse(
+  !is.na(mutations$vaf_BRCA1_somatic), mutations$vaf_BRCA1_somatic,
+  ifelse(
+    !is.na(mutations$vaf_BRCA2_somatic), mutations$vaf_BRCA2_somatic,
+    ifelse(
+      !is.na(mutations$vaf_TP53), mutations$vaf_TP53,
+      mutations$vaf_PALB2
+    )
+  )
+)
+
+mutations <- mutations[!is.na(mutations$sample_ID), ]
+
+# Create a named vector for mapping old values to new values
+mutation_mapping <- c("Frame_Shift_Del" = "frameshift",
+                      "Missense_Mutation" = "missense",
+                      "Splice_Site" = "splice",
+                      "Frame_Shift_Ins" = "frameshift", 
+                      "not_sequenced" = "not_sequenced")
+
+# Replace values in the specified columns
+mutations$BRCA1_somatic <- mutation_mapping[mutations$BRCA1_somatic]
+mutations$BRCA2_somatic <- mutation_mapping[mutations$BRCA2_somatic]
+mutations$TP53 <- mutation_mapping[mutations$TP53]
+mutations$PALB2 <- mutation_mapping[mutations$PALB2]
+```
+
+```{r}
+# To ichorCNA add the TS column from samples dataframe to filter out non-TS samples. Column ID in ichorCNA is the same as Library Name in samples
+ichorCNA <- merge(ichorCNA, samples[, c("Library Name", "TS", "source")], by.x = "ID", by.y = "Library Name", all.x = TRUE)
+
+mutations <- mutations[mutations$sample_ID %in% ichorCNA$TS, ]
+
+ichorCNA <- merge(
+  ichorCNA,
+  mutations[, c("sample_ID",
+                "BRCA1_somatic", "BRCA2_somatic",
+                "TP53",         "PALB2",
+                "vaf")],
+  by.x = "TS", by.y = "sample_ID",
+  all = TRUE
+)
+
+# 2) For each gene column, replace NA or "" with "NS"
+for(col in c("BRCA1_somatic", "BRCA2_somatic", "TP53", "PALB2")) {
+  # NAs → "NS"
+  ichorCNA[[col]][ is.na(ichorCNA[[col]]) ] <- "NS"
+  # blank strings → "NS"
+  ichorCNA[[col]][ ichorCNA[[col]] == "" ] <- "NS"
+}
+```
+
+
+
+```{r}
+
+# change ichorCNA Library Name column to sample 
+colnames(ichorCNA)[colnames(ichorCNA) == "ID"] <- "sample"
+colnames(ichorCNA)[colnames(ichorCNA) == "source"] <- "cancer_status"
+## Set samples to graph and order factors
+ichorCNA$sample <- as.factor(ichorCNA$sample)
+ichorCNA$cancer_status <- factor(ichorCNA$cancer_status,
+                                     levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes"),
+                                     labels = c("Cancer Positive (First Positive)", "Cancer Positive (Survivor Yes)", "Cancer Negative (Survivor No)", "Cancer Negative (Survivor Yes)"))
+
+```
+
+```{r}
+# alias tumour fraction for sorting
+ichorCNA$ichorCNA <- ichorCNA$Tumour.Fraction
+
+# reorder rows including TP53 and PALB2
+ichorCNA <- ichorCNA[order(
+  ichorCNA$cancer_status,
+  ichorCNA$ichorCNA,
+  factor(ichorCNA$BRCA1_somatic,
+         levels = c("NS", "",
+                    unique(ichorCNA$BRCA1_somatic)[
+                      !unique(ichorCNA$BRCA1_somatic) %in% c("NS", "")
+                    ])),
+  factor(ichorCNA$BRCA2_somatic,
+         levels = c("NS", "",
+                    unique(ichorCNA$BRCA2_somatic)[
+                      !unique(ichorCNA$BRCA2_somatic) %in% c("NS", "")
+                    ])),
+  factor(ichorCNA$TP53,
+         levels = c("NS", "",
+                    unique(ichorCNA$TP53)[
+                      !unique(ichorCNA$TP53) %in% c("NS", "")
+                    ])),
+  factor(ichorCNA$PALB2,
+         levels = c("NS", "",
+                    unique(ichorCNA$PALB2)[
+                      !unique(ichorCNA$PALB2) %in% c("NS", "")
+                    ])),
+  ichorCNA$vaf
+), ]
+
+# restore row names and capture order
+row.names(ichorCNA) <- ichorCNA$sample
+order <- row.names(ichorCNA)
+
+```
+
+```{r}
+### Get chromosome information
+chr <- segs[, 1:3]
+chr$chr <- gsub("chr", "", chr$chr)
+row.names(chr) <- paste0(chr$chr, "_", chr$start)
+```
+
+```{r}
+### Format and order segs
+row.names(segs) <- paste0(segs$chr, "_", segs$start)
+segs <- segs[, colnames(segs) %in% ichorCNA$sample]
+segs <- segs[, ichorCNA$sample]
+segs <- as.matrix(segs)
+segs <- t(segs)
+```
+
+```{r}
+# # Calculate the proportion of values > 3, ignoring NA
+# prop_above_1 <- colMeans(segs > .10, na.rm = TRUE)
+# # Identify columns where at least 95% are > 3
+# cols_to_remove <- names(prop_above_1[prop_above_1 >= 0.75 & !is.na(prop_above_1)])
+# # Print columns to remove
+# print(cols_to_remove)
+# # Remove them
+# segs <- segs[, !(colnames(segs) %in% cols_to_remove)]
+# 
+# 
+# # Extract the regions without the "chr" prefix to match the first column of chr
+# chr_regions_to_remove <- gsub("chr", "", cols_to_remove)
+# # Remove rows from chr where the rownames match the removed columns
+# chr <- chr[!(rownames(chr) %in% chr_regions_to_remove), ]
+# # Check result
+# print(chr)
+```
+
+```{r}
+### Make Mutation table
+data_mutation <- merge(mutations[,c("sample_ID", "BRCA1_somatic", "BRCA2_somatic", "TP53", "PALB2" )], ichorCNA[, c("TS", "sample")], by.x = "sample_ID", by.y = "TS", all = TRUE)
+data_mutation <- data_mutation[!(is.na(data_mutation$sample)), c("BRCA2_somatic", "BRCA1_somatic", "TP53", "PALB2", "sample")]
+```
+
+```{r}
+# Ensure TP53 and PALB2 missing calls are set to "NS"
+data_mutation$BRCA1_somatic <- ifelse(is.na(data_mutation$BRCA1_somatic), "NS", data_mutation$BRCA1_somatic)
+data_mutation$BRCA2_somatic <- ifelse(is.na(data_mutation$BRCA2_somatic), "NS", data_mutation$BRCA2_somatic)
+data_mutation$TP53         <- ifelse(is.na(data_mutation$TP53),          "NS", data_mutation$TP53)
+data_mutation$PALB2        <- ifelse(is.na(data_mutation$PALB2),       "NS", data_mutation$PALB2)
+
+# Reorder rows to match the sample order
+data_mutation <- data_mutation[order(factor(data_mutation$sample, levels = order)), ]
+
+# Subset into a matrix including all four genes
+data_mutation <- as.matrix(data_mutation[, c("BRCA1_somatic",
+                                             "BRCA2_somatic",
+                                             "TP53",
+                                             "PALB2")])
+# Update column names for the heatmap annotation
+colnames(data_mutation) <- c("BRCA1 Somatic",
+                             "BRCA2 Somatic",
+                             "TP53 Somatic",
+                             "PALB2 Somatic")
+# Preserve row names
+row.names(data_mutation) <- row.names(ichorCNA)
+```
+
+```{r}
+### Make ichorCNA table and apphend mutation information
+data_ichorCNA <- as.matrix(ichorCNA$ichorCNA)
+row.names(data_ichorCNA) <- ichorCNA$sample
+data_ichorCNA <- cbind(data_ichorCNA, c(rep((100*tumour_fraction_cutoff), nrow(data_ichorCNA))))
+
+mutations <- merge(mutations[,c("sample_ID", "vaf")], ichorCNA[, c("TS", "sample")], by.x = "sample_ID", by.y = "TS", all = TRUE)
+mutations <- mutations[!(is.na(mutations$sample)), c("vaf", "sample")]
+data_ichorCNA <- merge(data_ichorCNA, mutations, by.x = "row.names", by.y = "sample")
+
+row.names(data_ichorCNA) <- data_ichorCNA$Row.names
+data_ichorCNA <- data_ichorCNA[ichorCNA$sample, c("V1", "V2", "vaf")]
+```
+
+```{r}
+## Set Cancer status
+data_cancer <- as.matrix(ichorCNA$cancer_status)
+row.names(data_cancer) <- ichorCNA$sample
+```
+
+```{r}
+## Set colours
+col_fun <- colorRamp2(c(-.50, -0.01, 0.01, .50),
+                      c("#0000ff", "white", "white", "#ff0000"))
+
+
+
+col <- c(missense = "#4DAF4A", missense2 = "#4DAF4A", frameshift = "black", stop = "#A65628",
+         deletion = "#377EB8", splice_site = "#984EA3", NS = "grey95", not_sequenced = "grey65")
+#col_cancer <- c("Positive" = "#fb9a99", "Negative" = "#a6cee3")
+
+col_cancer <- c("Cancer Positive (First Positive)"= "#f87544", "Cancer Negative (Survivor No)" = "#9467bd", "Cancer Positive (Survivor Yes)" = "#f4c842", "Cancer Negative (Survivor Yes)" = "#1f77b4")
+```
+
+```{r}
+## Set variables
+alter_fun = function(x, y, w, h, v) {
+  # background
+  grid.rect(x, y, w*1, h*1, gp = gpar(fill = "grey95", col = "white", lwd = 0.5))
+  # alterations
+  n = sum(v)  # how many alterations for current gene in current sample
+  h = h
+  w = w
+  # use `names(which(v))` to correctly map between `v` and `col`
+  if(n) grid.rect(x - 0.5*w + 1:n/n*w, y, 1/n*w, h, 
+                  gp = gpar(fill = col[names(which(v))], col = "white", lwd = 0.5), just = "right")
+}
+```
+
+```{r}
+
+# 1) Prepare Cancer Status as a plain named vector
+data_cancer <- as.character(ichorCNA$cancer_status)
+names(data_cancer) <- ichorCNA$sample
+
+# 2) Define a left-hand annotation for the CN heatmap
+left_ichor_annotation <- rowAnnotation(
+  "Cancer Status" = anno_simple(
+    data_cancer,
+    col = col_cancer
+  ),
+  gap  = unit(3, "mm"),
+  show_annotation_name = TRUE,
+  border = FALSE,
+  annotation_name_side = "top",
+  simple_anno_size       = unit(0.3, "cm"),
+  annotation_name_gp   = gpar(fontsize = 8),
+  width                = unit(.5, "cm")
+)
+
+```
+
+```{r}
+## Set additional annotations
+right_annotation <- rowAnnotation(
+  "Tumour Fraction" = anno_lines(
+    data_ichorCNA,
+    add_points   = TRUE,
+    pch          = c(16, NA, 4),
+    gp           = gpar(col = c(NA, "red", NA),
+                         lty = c("solid", "dashed", "solid")),
+    pt_gp        = gpar(col = c("black", NA, "red")),
+    size         = unit(1, "mm"),
+    axis_param   = list(side = "top",
+                        labels_rot = 0,
+                        gp = gpar(fontsize = 8)),
+    border       = FALSE
+  ),
+  gap                     = unit(1, "mm"),
+  show_annotation_name    = TRUE,
+  annotation_name_side    = "top",
+  annotation_name_gp      = gpar(fontsize = 8),
+  border                  = FALSE,
+  simple_anno_size        = unit(0.3, "cm"),
+  width                   = unit(3.5, "cm")
+)
+
+```
+
+
+```{r}
+## Set legend labels
+annotation_legend = packLegend(
+  list(
+    Legend(
+      title = "Cancer Status",
+      at = c(
+        "Cancer Positive (First Positive)",
+        "Cancer Positive (Survivor Yes)",
+        "Cancer Negative (Survivor No)",
+        "Cancer Negative (Survivor Yes)"
+      ),
+      legend_gp = gpar(fill = c("#f87544","#f4c842", "#9467bd", "#1f77b4")),
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 7),
+      grid_height = unit(1, "mm"),
+      ncol = 2               # 4 items → 2 columns × 2 rows
+    ),
+    Legend(
+      title = "Somatic Mutation",
+      at = c("Missense", "Frameshift", "Stop", "Deletion", "Not Detected", "Not Sequenced"),
+      legend_gp = gpar(fill = c("#4DAF4A", "black", "#A65628", "#377EB8", "grey95", "grey65")),
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 7),
+      grid_height = unit(1, "mm"),
+      ncol = 3               # 6 items → 3 columns × 2 rows
+    ),
+    Legend(
+      title = "Copy Number",
+      at = c(-0.5, 0, 0.5),
+      col_fun = col_fun,
+      direction = "horizontal",
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 7),
+      grid_height = unit(2, "mm"),
+      ncol = 3               # 3 items → 3 columns × 1 row
+    ),
+    Legend(
+      title = "Scores",
+      type = "points",
+      at = c("Tumor Fraction", "Mutation VAF"),
+      pch = c(16, 4),
+      legend_gp = gpar(col = c("black", "red")),
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 7),
+      direction = "horizontal",
+      grid_height = unit(2, "mm"),
+      background = "white",
+      ncol = 2               # 2 items → 2 columns × 1 row
+    ),
+    Legend(
+      title = "",
+      type = "lines",
+      at = c("Tumour Fraction LOD"),
+      legend_gp = gpar(col = "red", lty = "dashed"),
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 7),
+      direction = "horizontal",
+      grid_height = unit(2, "mm"),
+      background = "white",
+      ncol = 1               # 1 item → 1 column × 1 row
+    )
+  ),
+  direction = "horizontal"    # pack all legends side by side
+)
+```
+
+```{r}
+# in column chr change chr1, chr2, chr3, chrX etc to 1, 2, 3, X etc
+
+## Set chromosome order
+chr_levels <- c(1:22, "X")
+
+chr$chr <- factor(chr$chr, levels = chr_levels)
+chr$chr <- factor(chr$chr, levels = chr_levels,
+                       labels = c(1:17, " ", 19, "  ", 21, "   ", "X"))
+```
+
+
+```{r}
+## Set orders
+row_order <- row.names(segs)
+col_order <- colnames(segs)
+row_split <- ichorCNA$cancer_status
+row_split <- factor(row_split, levels = c("Cancer Positive (First Positive)", "Cancer Positive (Survivor Yes)","Cancer Negative (Survivor No)", "Cancer Negative (Survivor Yes)"))
+col_split <- chr$chr
+```
+
+```{r}
+## Generate heatmap
+ichor <- Heatmap(segs,
+                 col = col_fun,
+                 use_raster = FALSE,
+                 show_heatmap_legend = FALSE,
+                 row_order = row_order,
+                 column_order = col_order,
+                 row_split = row_split,
+                 column_split = col_split,
+                 show_row_names = FALSE,
+                 column_title_gp = gpar(fontsize = 11),
+                 row_title = NULL,
+                 left_annotation = left_ichor_annotation, 
+                 show_column_names = FALSE,
+                 border = FALSE)
+```
+
+```{r}
+ichor
+```
+
+```{r}
+muts <- oncoPrint(data_mutation,
+                  alter_fun = alter_fun, 
+                  col = col,
+                  show_heatmap_legend = FALSE,
+                  row_order = row_order,
+                  top_annotation = NULL,
+                  right_annotation = right_annotation,
+                  row_split = row_split,
+                  show_row_names = FALSE,
+                  row_title_gp = gpar(fontsize = 0),
+                  show_column_names = TRUE,
+                  column_names_side = "top",
+                  column_names_rot = 90,
+                  column_names_gp = gpar(fontsize = 8),
+                  show_pct = FALSE,
+                  border = FALSE,
+                  width = unit(1.5, "cm"))
+muts
+Figure <- ichor + muts
+Figure
+```
+
+```{r}
+pdf(file.path(outdir, "02_figure_ichorCNA_correctedDepth_heatmap_to_publish.pdf"), width = 10, height = 6)
+draw(Figure, heatmap_legend_list = annotation_legend, heatmap_legend_side = "bottom", show_annotation_legend = FALSE) 
+dev.off()  # ✅ Close the device
+```
+
+
+```{r}
+writeLines(order, file.path(outdir_data, "02_figure_ichorCNA_sample_order_heatmap.txt"))
+```

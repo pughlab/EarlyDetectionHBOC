@@ -1,0 +1,60 @@
+---
+title: "04_processing_cohort_longitudinal_info"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("figures", "longitudinal")
+outdir_data <- here::here("data", "longitudinal")
+
+# read in data 
+long_data_path <- here::here("raw_data", "longitudinal", "screening_data_longitudinal_info_V2.csv")
+long_data <- read.csv(long_data_path, header=TRUE, check.names=FALSE)
+```
+
+```{r}
+# Convert Date column to Date type
+long_data$Date <- as.Date(long_data$Date)
+
+# Calculate the baseline (earliest Blood Draw) per patient
+baseline_df <- long_data %>%
+  dplyr::filter(Event_Type == "Blood Draw") %>%
+  dplyr::group_by(Patient_ID) %>%
+  dplyr::summarise(baseline = min(Date, na.rm = TRUE), .groups = "drop")
+
+# Join the baseline back to the original data
+long_data <- long_data %>%
+  left_join(baseline_df, by = "Patient_ID") %>%
+  dplyr::mutate(
+    months_from_baseline = as.numeric(difftime(Date, baseline, units = "days")) / 30.44
+  )
+
+```
+
+```{r}
+write.csv(
+  long_data,
+  file = file.path(outdir_data, paste0("01_processing_longitudinal_samples.csv")),
+  row.names = FALSE
+)
+```

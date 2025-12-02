@@ -1,0 +1,144 @@
+---
+title: "01_coverage_information_WGS_TS_cfMEDIP"
+output: html_document
+date: "2025-05-15"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(tidyr)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+outdir <- here::here("data", "coverage")
+
+# Load data
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(metadata_path, sheet = "April22")
+
+# Initial filtering
+samples <- samples[!grepl("-Tumour", samples$group_id), ]
+samples <- samples[!samples$group_id %in% c(
+  "LIB-04-0304-T5-B", "LIB-04-0329-T0-B", "LIB-04-0486-T0-B",
+  "LIB-04-0811-T0-B", "LIB-04-0819-T0-B", "LIB-04-0834-T0-B",
+  "LIB-04-0996-T0-B", "LIB-04-0997-T0-B"
+), ]
+
+
+# Remove problematic TS entries
+samples$TS[samples$TS %in% c(
+  "TGL49_0085_Cf_U_PE_4150_WG", 
+  "TGL49_0291_Pl_T_PE_405_PG", 
+  "TGL49_0293_Pl_T_PE_385_PG", 
+  "TGL49_0252_Cf_n_PE_1110_WG"
+)] <- NA
+
+# Remove specific group_ids
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+
+# Read coverage data
+TS_coverage <- read.csv(here::here("raw_data", "coverage", "TS_coverage_summary_May27.csv"), check.names = FALSE)
+WGS_coverage <- read.csv(here::here("raw_data", "coverage", "COVERAGE_HBOC_WGS_downsampled_bwa_bams_16102025_merged.csv"), check.names = FALSE)
+cfMeDIP_coverage <- read.delim(here::here("raw_data", "coverage", "cfMeDIP_aligned_reads.tsv"), sep="\t")
+
+WGS_coverage$WGS <- gsub("(_downsampled|_downsample)$", "", WGS_coverage$WGS)
+```
+
+```{r}
+# Merge TS coverage
+samples <- left_join(samples, TS_coverage, by = c("TS" = "TS")) %>% 
+  dplyr::rename(TS_coverage = coverage)
+
+# Merge WGS coverage
+samples <- left_join(samples, WGS_coverage, by = c("Library Name" = "WGS")) %>%
+  dplyr::rename(WGS_coverage = coverage)
+
+samples <- left_join(samples, cfMeDIP_coverage, by = c("cfMeDIP" = "samplename")) %>%
+  dplyr::rename(cfMeDIP_total_reads = Successfully.aligned.reads)
+
+# Identify missing TS and WGS coverage
+missing_TS <- samples[is.na(samples$TS_coverage) & !is.na(samples$TS), c("group_id", "TS")]
+missing_WGS <- samples[is.na(samples$WGS_coverage) & !is.na(samples$`Library Name`), c("group_id", "Library Name")]
+
+missing_cfMeDIP <- samples[is.na(samples$cfMeDIP_total_reads) & !is.na(samples$cfMeDIP), c("group_id", "cfMeDIP")]
+
+# Report number of missing
+cat("Missing TS coverage for", nrow(missing_TS), "samples\n")
+cat("Missing WGS coverage for", nrow(missing_WGS), "samples\n")
+cat("Missing cfMeDIP coverage for", nrow(missing_cfMeDIP), "samples\n")
+
+# Preview merged data
+merged_data <- samples %>% 
+  dplyr::select(group_id, timepoint, `Library Name`, TS, cfMeDIP, WGS_coverage, TS_coverage, cfMeDIP_total_reads)
+```
+
+```{r}
+missing_cfMeDIP
+```
+
+```{r}
+# note: TGL49_0144_Ly_R_PE_361_TS and 	TGL49_0145_Ly_R_PE_348_TS are tumour only samples. 
+cat("TS entries in sample metadata but not in samples:\n")
+missing_TS
+```
+
+```{r}
+missing_WGS
+```
+
+```{r}
+# Get TS and WGS values in samples
+ts_in_samples <- unique(samples$TS[!is.na(samples$TS)])
+wgs_in_samples <- unique(samples$`Library Name`[!is.na(samples$`Library Name`)])
+cfMeDIP_in_samples <- unique(samples$cfMeDIP[!is.na(samples$cfMeDIP)])
+
+# Get missing TS and WGS entries not in samples
+ts_not_in_samples <- TS_coverage[!TS_coverage$TS %in% ts_in_samples, , drop = FALSE]
+wgs_not_in_samples <- WGS_coverage[!WGS_coverage$WGS %in% wgs_in_samples, , drop = FALSE]
+cfMeDIP_not_in_samples <- cfMeDIP_coverage[!cfMeDIP_coverage$samplename %in% cfMeDIP_in_samples, , drop = FALSE]
+
+
+# Print them
+cat("TS entries in TS_coverage but not in samples:\n")
+print(ts_not_in_samples)
+
+cat("\nWGS entries in WGS_coverage but not in samples:\n")
+print(wgs_not_in_samples)
+
+cat("\ncfMeDIP entries in cfMeDIP_coverage but not in samples:\n")
+print(cfMeDIP_not_in_samples)
+```
+
+
+```{r} 
+# Filter out rows containing "Ly_R_WG" in the WGS_coverage column
+filtered_data <- merged_data[!grepl("Ly_R_WG", merged_data$'Library Name'), ]
+
+# Calculate the range of values in the WGS_coverage column
+coverage_range <- range(filtered_data$WGS_coverage, na.rm = TRUE)
+# Print the result
+print(coverage_range)
+
+coverage_median <- median(filtered_data$WGS_coverage, na.rm = TRUE)
+print(coverage_median)
+```
+
+```{r}
+# Optional: write to file
+write.csv(merged_data, file = file.path(outdir, "01_coverage_sequencing_samples.csv"), row.names = FALSE)
+
+```

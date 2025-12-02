@@ -1,0 +1,92 @@
+---
+title: "02_metrics_DNA_extraction_control_samples"
+output: html_document
+date: "2025-03-20"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(reshape2)
+library(ggformula)
+library(signal)
+library(matrixStats)
+library(lemon)
+library(ggpubr)
+library(data.table)
+library(readxl)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("data", "DNA_extraction")
+
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header=TRUE, check.names=FALSE)
+scores_normal <- scores_normal$Sample
+
+# DNA_ext_path <- here::here("raw_data", "DNA_extraction", "Erik-Yield-Request-2025-02-28.xlsx")
+# DNA_ext <- read_excel(DNA_ext_path)
+
+HCC_healthy_path <- here::here("raw_data", "DNA_extraction", "Healthy Controls Processing Log.xlsx")
+HCC_healthy_ext <- read_excel(HCC_healthy_path, sheet="cfDNA")
+
+CHARM_sample_ext_path <- here::here("raw_data", "DNA_extraction", "HBC_Processing Log.xlsx")
+CHARM_sample_ext <- read_excel(CHARM_sample_ext_path, sheet="cfDNA")
+
+CHARM_sample_tracker_path <- here::here("raw_data", "DNA_extraction", "CHARM Sample Tracker.xlsx")
+CHARM_sample_tracker <- read_excel(CHARM_sample_tracker_path, sheet="HBC")
+CHARM_sample_tracker <- CHARM_sample_tracker[, c("sWGS", "LIB_ID", "timepoint")]
+```
+
+```{r}
+CHARM_sample_tracker$group_id <- paste0(CHARM_sample_tracker$LIB_ID, "-T", CHARM_sample_tracker$timepoint)
+# CHARM_sample_tracker$sWGS[CHARM_sample_tracker$sWGS %in% scores_normal]
+```
+
+```{r}
+missing_samples <- scores_normal[!scores_normal %in% CHARM_sample_tracker$sWGS]
+# Convert missing_samples to dataframe
+missing_samples_df <- data.frame(missing_samples)
+
+# Export missing_samples
+write.csv(missing_samples_df, "/Users/erikensminger/Desktop/missing_samples.csv", row.names = FALSE)
+
+# missing_samples
+```
+
+```{r}
+CHARM_sample_tracker <- CHARM_sample_tracker[CHARM_sample_tracker$sWGS %in% scores_normal, ]
+```
+
+```{r}
+# Add HCC-### column
+HCC_healthy_ext$HCC_ID <- paste0("HCC-", sprintf("%03d", HCC_healthy_ext$`#`))
+HCC_healthy_ext <- HCC_healthy_ext[, c("HCC_ID", setdiff(names(HCC_healthy_ext), "HCC_ID"))]
+
+# Step 1: Extract numeric codes from scores_normal
+scores_normal_num <- sub("HCC-", "", scores_normal)  # removes "HCC-"
+
+# Step 2: Convert to numeric (optional but recommended if HCC_healthy_ext$`#` is numeric)
+scores_normal_num <- as.numeric(scores_normal_num)
+
+# Step 3: Subset HCC_healthy_ext where # is in the extracted numbers
+HCC_healthy_ext_subset <- HCC_healthy_ext[HCC_healthy_ext$`#` %in% scores_normal_num, ]
+```
+
+```{r}
+
+HCC_path <- file.path(outdir, "HCC_healthy_ext_subset.csv")
+
+# Export HCC_healthy_ext_subset
+write.csv(HCC_healthy_ext_subset, HCC_path, row.names = FALSE)
+
+CHARM_path <- file.path(outdir, "CHARM_sample_tracker_filtered.csv")
+# Export CHARM_sample_tracker
+write.csv(CHARM_sample_tracker, CHARM_path, row.names = FALSE)
+```

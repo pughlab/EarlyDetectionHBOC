@@ -1,0 +1,298 @@
+---
+title: "02_processing_statistics_integrated_cancer_scores"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(pROC)
+library(pracma)
+library(caret)
+library(here)
+
+# Set seed for reproducibility
+set.seed(42)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+date <- Sys.Date();
+```
+
+```{r}
+# Create output directory if it doesn't exist
+outdir <- here::here("data", "statistics")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+# ==========================
+# Read in data
+# ==========================
+
+# HBOC scores
+scores_path <- here::here("data", "statistics", "01_statistics_HBOC_scores.csv")
+scores <- read.csv(scores_path, header = TRUE, check.names = FALSE)
+scores_original <- scores
+
+# Filter scores
+scores <- scores[
+  !grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", scores$TS) &
+  !grepl("T-788-T0", scores$group_id) &
+  !grepl("T-207-T0", scores$group_id) &
+  !(is.na(scores$TS) | scores$TS == "" |
+    is.na(scores$`Library Name`) | scores$`Library Name` == ""),
+]
+
+# Control scores
+control_scores_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+control_scores <- read.csv(control_scores_path, header = TRUE, check.names = FALSE)
+
+# Samples metadata
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(samples_path, sheet = "April22")
+
+# Filter samples
+samples <- samples[
+  !grepl("-B|-Tumour", samples$group_id) &
+  !grepl("TGL49_0341_Cf_n_TS_LIB-04-0154-T1-P-DNA", samples$TS) &
+  !grepl("T-788-T0", samples$group_id) &
+  !grepl("T-207-T0", samples$group_id) &
+  !(is.na(samples$TS) | samples$TS == "" |
+    is.na(samples$`Library Name`) | samples$`Library Name` == ""),
+]
+
+mutation_vafs <- read_excel(here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+mutation_vafs <- mutation_vafs[, c("group_id", "vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "vaf_TP53", "vaf_PALB2")]
+# 
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive")]
+data <- merge(samples, scores, by.x = c("Library Name", "TS"), by.y = c("Library Name", "TS"), all.y = TRUE)
+
+data <- data[!data$months_to_positive %in% c("pending", "UNK"), ]
+```
+
+```{r}
+# Ensure months_to_positive is a character and clean spaces
+data$months_to_positive <- as.character(data$months_to_positive)
+data$months_to_positive <- trimws(data$months_to_positive)
+
+# Convert to numeric where possible, keeping "no_future_cancer" intact
+data$months_to_positive_numeric <- suppressWarnings(as.numeric(data$months_to_positive))
+
+filtered_data <- data
+```
+
+```{r}
+mutation_vafs$mutation_vaf <- apply(mutation_vafs[, c("vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "vaf_TP53", "vaf_PALB2")], 1, function(x) {
+  vals <- x[!is.na(x)]
+  if (length(vals) == 1) {
+    return(vals)
+  } else {
+    return(NA)
+  }
+})
+
+mutation_vafs$mutation_vaf[is.na(mutation_vafs$mutation_vaf)] <- 0
+# 
+# # Optionally drop the original columns
+mutation_vafs<- mutation_vafs[, c("group_id", "mutation_vaf")]
+filtered_data <- merge(filtered_data, mutation_vafs, by = "group_id", all.x = TRUE)
+
+# Exclude Specific Samples
+samples_to_exclude <- c("LIB-04-0376-T2", "LIB-04-0428-T3", "LIB-04-0154-T0", "LIB-04-0664-T0")
+
+filtered_data <- filtered_data[!filtered_data$group_id %in% samples_to_exclude, ]
+```
+
+```{r}
+filtered_data$Tumour.Fraction <- log1p(filtered_data$Tumour.Fraction)
+filtered_data$fragment_ratio_corr <- -log1p(1 - filtered_data$fragment_ratio_corr)
+
+# Assign ROC labels
+filtered_data$roc_label <- ifelse(
+  filtered_data$cancer_status == "positive" | 
+  (filtered_data$cancer_status == "negative" & !is.na(filtered_data$months_to_positive_numeric) & filtered_data$months_to_positive_numeric <= 12), 
+  1,  # Positive case
+  0   # Negative case (no_future_cancer)
+)
+
+filtered_data <- filtered_data[,c("group_id", "roc_label","FS",  "avg_zscore_nuc_peaks", "fragment_ratio_corr", "Tumour.Fraction", "consensus_griffin", "mutation_vaf")]
+
+count(filtered_data$roc_label == 0)
+count(filtered_data$roc_label == 1)
+
+roc_columns <- c(
+  "FS" = "Fragmentation Score",
+  "avg_zscore_nuc_peaks" = "Nucleosome Peak Score",
+  "fragment_ratio_corr" = "Fragment Ratio Score",
+  "Tumour.Fraction" = "Copy Number",
+  "consensus_griffin" = "Griffin Consensus Score",
+  "mutation_vaf" = "Mutation Status"
+)
+```
+
+```{r}
+train_ctDNA_model <- function(data, outcome_col = "roc_label", 
+                              features = c("FS", "avg_zscore_nuc_peaks", "fragment_ratio_corr", 
+                                           "Tumour.Fraction", "consensus_griffin", "mutation_vaf"), 
+                              repeats = 100, folds = 10) {
+  data[[outcome_col]] <- factor(data[[outcome_col]], levels = c(0, 1), labels = c("Negative", "Positive"))
+
+  prediction_list <- list()
+  coefficient_list <- list()  # NEW: Store coefficients
+  
+  #set.seed(42)
+  for (i in 1:repeats) {
+    # set.seed(i)
+
+    pos_data <- dplyr::filter(data, !!sym(outcome_col) == "Positive")
+    neg_data <- dplyr::filter(data, !!sym(outcome_col) == "Negative")
+    # when there are more pos than neg samples
+    downsampled_pos <- sample_n(pos_data, nrow(neg_data))
+    downsampled_data <- bind_rows(neg_data, downsampled_pos)
+    
+    downsampled_data_model <- downsampled_data[, c("group_id", outcome_col, features)]
+    train_index <- createDataPartition(downsampled_data_model[[outcome_col]], p = 0.80, list = FALSE)
+    train_data <- downsampled_data_model[train_index, ]
+    val_data <- downsampled_data_model[-train_index, ]
+
+    train_control <- trainControl(
+      method = "cv",
+      number = folds,
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+
+    formula_str <- paste(outcome_col, "~", paste(features, collapse = " + "))
+    model <- train(
+      as.formula(formula_str),
+      data = train_data,
+      method = "glm",
+      family = "binomial",
+      trControl = train_control,
+      metric = "ROC"
+    )
+
+    # NEW: extract coefficients
+    coefs <- coef(model$finalModel)
+    coefs_df <- data.frame(
+      Feature = names(coefs),
+      Coefficient = as.numeric(coefs),
+      Iteration = i
+    )
+    coefficient_list[[i]] <- coefs_df
+
+    # Predict on validation set
+    val_predictions <- predict(model, newdata = val_data, type = "prob")[, "Positive"]
+    val_data$predicted_probability <- val_predictions
+    prediction_list[[i]] <- val_data[, c("group_id", "predicted_probability")]
+  }
+
+  # Combine predictions
+  all_predictions <- bind_rows(prediction_list)
+  integrated_scores <- all_predictions %>%
+    dplyr::group_by(group_id) %>%
+    dplyr::summarise(integrated_ctDNA_score = mean(predicted_probability, na.rm = TRUE), .groups = "drop")
+  
+  data <- left_join(data, integrated_scores, by = "group_id")
+
+  # Combine coefficients and calculate feature importance
+  all_coefficients <- bind_rows(coefficient_list)
+  coefficient_summary <- all_coefficients %>%
+    dplyr::filter(Feature != "(Intercept)") %>%
+    dplyr::group_by(Feature) %>%
+    dplyr::summarise(
+      Coef_Mean = mean(Coefficient, na.rm = TRUE),
+      Coef_SD = sd(Coefficient, na.rm = TRUE),
+      Coef_Lower_CI = Coef_Mean - 1.96 * Coef_SD / sqrt(n()),
+      Coef_Upper_CI = Coef_Mean + 1.96 * Coef_SD / sqrt(n()),
+      Abs_Coef = abs(Coef_Mean),
+      OR_Mean = exp(Coef_Mean),
+      OR_Lower_CI = exp(Coef_Lower_CI),
+      OR_Upper_CI = exp(Coef_Upper_CI),
+      .groups = "drop"
+    )
+
+  return(list(model = model, data = data, coefficients = coefficient_summary, predictions = all_predictions))
+}
+```
+
+```{r}
+# Run the function with feature selection
+result <- train_ctDNA_model(filtered_data)
+
+# Extract trained model and updated dataset
+trained_model <- result$model
+scored_data <- result$data
+feature_importance <- result$coefficients
+predictions <- result$predictions
+
+# View integrated ctDNA scores
+head(scored_data)
+
+print(feature_importance)
+```
+
+```{r}
+count(scored_data$integrated_ctDNA_score >= 0.5)
+
+count(scored_data$integrated_ctDNA_score < 0.5)
+
+count(scored_data$integrated_ctDNA_score >= 0.5 & scored_data$roc_label == "Positive")
+count(scored_data$integrated_ctDNA_score < 0.5 & scored_data$roc_label == "Negative")
+count(scored_data$integrated_ctDNA_score >= 0.5 & scored_data$roc_label == "Negative")
+count(scored_data$integrated_ctDNA_score < 0.5 & scored_data$roc_label == "Positive")
+```
+
+```{r}
+# Merge integrated scores back into the original dataset
+data_with_integration_score <- left_join(scores_original, scored_data[, c("group_id", "integrated_ctDNA_score")], by = "group_id")
+
+# Export the updated dataset
+output_path <- paste0(outdir, "/02_processing_statistics_integrated_cancer_scores.csv")
+write.csv(data_with_integration_score, output_path, row.names = FALSE)
+
+# Export feature importance
+outpath_path_V2 <- paste0(outdir, "/02_processing_statistics_integrated_cancer_scores_feature_importance.csv")
+write.csv(feature_importance, outpath_path_V2, row.names = FALSE)
+
+# View output file path
+print(paste("Saved results to:", output_path))
+```
+
+```{r}
+# Export feature importance
+outpath_path_V3 <- paste0(outdir, "/02_processing_statistics_integrated_all_score_predictions.csv")
+write.csv(predictions, outpath_path_V3, row.names = FALSE)
+```

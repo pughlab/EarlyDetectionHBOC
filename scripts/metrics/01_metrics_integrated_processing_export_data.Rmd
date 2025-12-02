@@ -1,0 +1,157 @@
+---
+title: "01_metrics_integrated_processing_export_data"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# Define directories
+outdir <- here::here("figures", "statistics")
+outdir_data <- here::here("data", "metrics")
+
+# Create directories if they do not exist
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+if (!dir.exists(outdir_data)) dir.create(outdir_data, recursive = TRUE)
+
+# Define data paths
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+metadata_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+# Read in data
+scores <- read.csv(scores_path, header = TRUE, check.names = FALSE)
+scores_normal <- read.csv(scores_normal_path, header = TRUE, check.names = FALSE)
+
+# Load sample metadata and filter
+samples <- readxl::read_excel(metadata_path, sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("group_id", "Library Name", "TS", "source", "cancer_type", "survivor", "months_to_positive", "next_positive_cancer")]
+```
+
+```{r}
+data <- merge(samples, scores, by.x = c("group_id", "Library Name", "TS"), by.y = c("group_id", "Library Name", "TS"), all.y = TRUE)
+data <- data %>% dplyr::select(group_id, LIB_ID, `Library Name`, TS, everything())
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+data$TS[data$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+data$TS[data$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+data$TS[data$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+data$TS[data$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+# remove 2 CHARMQ samples that we couldn't verify germline mutation
+data <- data[!grepl("T-788-T0", data$group_id), ]
+data <- data[!grepl("T-207-T0", data$group_id), ]
+
+# remove cfMeDIP samples 
+data <- data[!grepl("LIB-04-0649-T0", data$group_id), ]
+data <- data[!grepl("LIB-04-0441-T1", data$group_id), ]
+data <- data[!grepl("LIB-04-0024-T2", data$group_id), ]
+data <- data[!grepl("LIB-04-0131-T0", data$group_id), ]
+
+# Remove samples with months_to_positive == "UNK" or "pending"
+data <- data[!data$months_to_positive %in% c("UNK", "pending"), ]
+```
+
+```{r}
+nucleosome_peak_cutoff <- quantile(scores_normal$avg_zscore_nuc_peaks, 0.99, na.rm = TRUE)
+tumour_fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+fragment_ratio_cutoff <- quantile(scores_normal$fragment_ratio_corr , 0.01, na.rm = TRUE)
+fragment_length_cutoff <- quantile(scores_normal$FS , 0.99, na.rm = TRUE)
+consensus_griffin_cutoff <- quantile(scores_normal$consensus_griffin, 0.01, na.rm = TRUE)
+integrated_ctDNA_score_cutoff <- 0.5 
+```
+
+```{r}
+# Step 1: Filter valid samples with TS and WGS
+valid_samples <- data[
+  !is.na(data$`Library Name`) & data$`Library Name` != "" &
+  !is.na(data$TS) & data$TS != "",
+]
+
+# Step 2: Define binary signal flags (excluding integrated_ctDNA_score)
+valid_samples$signal_nucleosome     <- valid_samples$avg_zscore_nuc_peaks >= nucleosome_peak_cutoff
+valid_samples$signal_fragment_ratio <- valid_samples$fragment_ratio_corr <= fragment_ratio_cutoff
+valid_samples$signal_fragment_length <- valid_samples$FS >= fragment_length_cutoff
+valid_samples$signal_griffin        <- valid_samples$consensus_griffin < consensus_griffin_cutoff
+valid_samples$signal_tf             <- valid_samples$Tumour.Fraction >= tumour_fraction_cutoff
+valid_samples$signal_mutation       <- !is.na(valid_samples$Mutation) & valid_samples$Mutation != ""
+
+# Step 3: Combine signals and count per sample
+signal_cols <- c(
+  "signal_nucleosome",
+  "signal_fragment_ratio",
+  "signal_fragment_length",
+  "signal_griffin",
+  "signal_tf",
+  "signal_mutation"
+)
+valid_samples$n_signals <- rowSums(valid_samples[, signal_cols], na.rm = TRUE)
+```
+
+```{r}
+### Export valid_signals with date-stamped filename ---
+
+# Columns to remove: starts with 'AverageZScore_' or exact matches
+cols_to_remove <- grep("^AverageZScore_|^(Tumour\\.Fraction|FS|HBOC_ovarian|HBOC_breast|fragment_ratio_corr|avg_zscore_nuc_peaks|consensus_griffin|Mutation)$", 
+                       colnames(valid_samples), value = TRUE)
+
+# Remove the columns
+valid_signals_export <- valid_samples[, !colnames(valid_samples) %in% cols_to_remove]
+
+# Standardize cancer_type entries
+valid_signals_export$cancer_type[valid_signals_export$cancer_type == "hgsoc"] <- "ovarian"
+valid_signals_export$cancer_type[valid_signals_export$cancer_type == "thyroid, hgsoc"] <- "ovarian"
+
+# Create filename with date
+date_stamp <- Sys.Date()
+outfile <- file.path(outdir_data, paste0("01_metrics_integrated_cleaned.csv"))
+
+# Write CSV
+write.csv(valid_signals_export, file = outfile, row.names = FALSE)
+
+cat("Exported to:", outfile, "\n")
+```

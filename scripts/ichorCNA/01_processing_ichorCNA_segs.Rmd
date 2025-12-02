@@ -1,0 +1,123 @@
+---
+title: "01_processing_ichorCNA_segs"
+output: html_document
+date: "`r Sys.Date()`"
+params:
+  raw_data_input_dir: "HBOC_ichorCNA" 
+---
+
+```{r}
+library(tidyverse)
+library(plyr)
+library(data.table)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# Set working directory to project root via here()
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+
+```{r}
+raw_data_input_dir <- params$raw_data_input_dir
+paths <- here::here("raw_data", "ichorCNA", raw_data_input_dir)
+
+# Project name
+project <- "01_processing_ichorCNA_HBOC"
+
+# Output directory (local CloudStorage)
+outdir_segs <- here::here("data", "ichorCNA", "01_processing_ichorCNA_HBOC_segs")
+outdir_combined <- here::here("data", "ichorCNA")
+
+# Create output directories if they don't exist
+for (d in c(outdir_segs, outdir_combined)) {
+  if (!dir.exists(d)) {
+    dir.create(d, recursive = TRUE, showWarnings = FALSE)
+    message("Created output directory: ", d)
+  } else {
+    message("Using existing output directory: ", d)
+  }
+}
+
+# Initialize to collect merged data across all paths
+data_seg <- NULL
+
+# Samples to exclude
+samples_to_exclude <- c(
+  "CHARMQ_0788_Pl_T_PG_T-788",
+  "CHARMQ_0207_Pl_T_PG_T-207"
+)
+```
+
+```{r}
+# Loop through each path
+for (path in paths) {
+  # Get file names within the current path
+  names <- list.files(path = path, pattern = ".correctedDepth.txt", full.names = FALSE, recursive = TRUE)
+  
+  #exclude the CHARMQ samples
+  to_exclude <- sapply(names, function(n) any(grepl(paste0(samples_to_exclude, collapse = "|"), n)))
+  names <- names[!to_exclude]
+  
+  for (name in names) {
+    dir_path <- dirname(name)
+    base_name <- sub(".correctedDepth.txt$", "", basename(name))
+    
+    # Read files and extract required columns
+    rows <- read.delim(file.path(path, name))
+    rows <- rows[, colnames(rows) %in% c("chr", "start", "end")]
+    levels_chr <- c(paste0("chr", 1:22), "chrX")
+    rows$chr <- factor(rows$chr, levels = levels_chr)
+    
+    # Load segment information
+        seg_file <- list.files(
+      path = paths,
+      pattern = paste0(base_name, "\\.seg$"),
+      full.names = TRUE,
+      recursive = TRUE
+    )
+    segs <- read.delim(seg_file[1])
+    segs_loc <- segs[, colnames(segs) %in% c("chr", "start", "end")]
+    segs_loc$chr <- factor(segs_loc$chr, levels = levels_chr)
+    
+    # Find overlaps
+    setDT(segs_loc)
+    setDT(rows)
+    setkey(segs_loc)
+    overlap <- foverlaps(rows, segs_loc, type="within", nomatch=0L)
+    
+    # Merge overlap information and save to individual files
+    seg_table <- merge(overlap, segs[, colnames(segs) %in% c("chr", "start", "end", "median")], by = c("chr", "start", "end"))
+    seg_table <- as.data.frame(seg_table)
+    seg_table <- seg_table[, colnames(seg_table) %in% c("chr", "i.start", "i.end", "median")]
+    colnames(seg_table) <- c("chr", "start", "end", "median")
+    write.table(seg_table, file.path(outdir_segs, paste0(base_name, "_seg.txt")), sep = "\t", row.names = FALSE)
+  }
+
+}
+
+  # Gather segment files for merging
+  files <- list.files(outdir_segs, pattern = "_seg.txt", full.names = TRUE)
+  # Initialize data_seg only once and merge subsequent files
+  for (file in files) {
+    name <- gsub(pattern = paste0(outdir_segs, "/"), "", x = file)
+    name <- sub("_seg\\.txt$", "", name)
+    file_data <- read.delim(file)
+    colnames(file_data) <- c("chr", "start", "end", name)
+    
+    # Merge the data into data_seg, initialize if not done yet
+    if (is.null(data_seg)) {
+      data_seg <- file_data
+    } else {
+      data_seg <- merge(data_seg, file_data, by = c("chr", "start", "end"), all = TRUE)
+    }
+  }
+```
+
+```{r}
+# Sort and save the final combined data
+data_seg <- data_seg[order(factor(data_seg$chr, levels = c(1:22, "X")), data_seg$start), ]
+write.table(data_seg, file.path(outdir_combined, paste0(project, "_segs.txt")), row.names = FALSE, sep = "\t")
+```

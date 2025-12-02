@@ -1,0 +1,198 @@
+---
+title: "01_metrics_DNA_extraction_HBOC_samples"
+output: html_document
+date: "2025-03-20"
+---
+
+```{r}
+library(dplyr)
+library(readxl)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# outdir <- "./figures"
+outdir <- here::here("data", "DNA_extraction")
+
+# read in data 
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header=TRUE, check.names=FALSE)
+scores_normal <- scores_normal[, c("Sample")]
+
+samples <- read_excel(here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx"), sheet="April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+
+
+DNA_ext_path <- here::here("raw_data", "DNA_extraction", "DNA_extraction_HBOC_and_Healthy.xlsx")
+DNA_ext <- read_excel(DNA_ext_path, sheet="HBOC")
+
+#CHARM_sample_tracker_path <- "./raw_data/DNA_extraction/Healthy_control_DNA_extraction.xlsx"
+CHARM_sample_normal <- read_excel(DNA_ext_path, sheet="Healthy")
+```
+
+```{r}
+samples <- samples[, c("group_id", "Library Name", "TS", "sex")]
+```
+
+```{r}
+data <- merge(samples, scores, by.x = c("group_id", "Library Name", "TS"), by.y = c("group_id", "Library Name", "TS"), all.y = TRUE)
+data <- data %>% dplyr::select(group_id, LIB_ID, `Library Name`, TS, everything())
+
+# remove WGS samples that were don't have TS done - we just used to verify germline mutatation
+data$TS[data$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+data$TS[data$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+data$TS[data$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+data$TS[data$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+data <- data[,c("group_id", "Library Name", "TS", "cancer_status", "sex")]
+data <- data[!(is.na(data$TS) & is.na(data$`Library Name`)), 
+             c("group_id", "Library Name", "TS", "cancer_status", "sex")]
+```
+
+```{r}
+
+DNA_ext_w_sample_info <- merge(data, DNA_ext, by.x = "group_id", by.y = "Pugh Lab ID", all.x = TRUE)
+DNA_ext_w_sample_info_plasma <- DNA_ext_w_sample_info[!grepl("Buffy Coat", DNA_ext_w_sample_info$`Sample Type`),]
+```
+
+```{r}
+DNA_ext_w_sample_info_plasma <- DNA_ext_w_sample_info_plasma[,c("group_id","ng/mL", "cancer_status", "sex")]
+DNA_ext_w_sample_info_plasma <- DNA_ext_w_sample_info_plasma[!grepl("T-788-T0", DNA_ext_w_sample_info_plasma$group_id), ]
+DNA_ext_w_sample_info_plasma <- DNA_ext_w_sample_info_plasma[!grepl("T-207-T0", DNA_ext_w_sample_info_plasma$group_id), ]
+```
+
+
+```{r}
+# Use full HBOC dataset (no outlier removed)
+df <- DNA_ext_w_sample_info_plasma
+
+# Overall
+overall_median <- median(df$`ng/mL`, na.rm = TRUE)
+overall_sd <- sd(df$`ng/mL`, na.rm = TRUE)
+
+# Cancer-negative
+neg <- df[df$cancer_status == "negative", ]
+neg_median <- median(neg$`ng/mL`, na.rm = TRUE)
+neg_sd <- sd(neg$`ng/mL`, na.rm = TRUE)
+
+# Cancer-positive
+pos <- df[df$cancer_status == "positive", ]
+pos_median <- median(pos$`ng/mL`, na.rm = TRUE)
+pos_sd <- sd(pos$`ng/mL`, na.rm = TRUE)
+
+# Male BRCA1/2m-carriers (full dataset)
+male <- df[df$sex == "male", ]
+male_median <- median(male$`ng/mL`, na.rm = TRUE)
+male_sd <- sd(male$`ng/mL`, na.rm = TRUE)
+
+# Female BRCA1/2m-carriers (full dataset)
+female <- df[df$sex == "female", ]
+female_median <- median(female$`ng/mL`, na.rm = TRUE)
+female_sd <- sd(female$`ng/mL`, na.rm = TRUE)
+
+# Output
+cat(sprintf(
+  "DNA extraction yielded a median of %.1f ng/mL of plasma (SD = %.1f) with no difference detected between cancer-negative (median = %.1f, SD = %.1f) and cancer-positive (median = %.1f, SD = %.1f) BRCA1/2m-carriers, male (median = %.1f, SD = %.1f) and female (median = %.1f, SD = %.1f) BRCA1/2m-carriers.\n",
+  overall_median, overall_sd,
+  neg_median, neg_sd,
+  pos_median, pos_sd,
+  male_median, male_sd,
+  female_median, female_sd
+))
+```
+
+# Control Samples 
+```{r}
+# Calculate ng/mL DNA yield
+CHARM_sample_normal$ng_per_mL <- CHARM_sample_normal$`DNA yield (ng)` / CHARM_sample_normal$`Original Plasma Volume (ml)`
+
+# Calculate median and standard deviation
+healthy_median <- median(CHARM_sample_normal$ng_per_mL, na.rm = TRUE)
+healthy_sd <- sd(CHARM_sample_normal$ng_per_mL, na.rm = TRUE)
+
+# Output the result
+cat(sprintf("Healthy controls had a median DNA yield of %.1f ng/mL of plasma (SD = %.1f).\n",
+            healthy_median, healthy_sd))
+```
+
+# Integrated Healthy and Control 
+```{r}
+# First, ensure healthy data has the same column names
+CHARM_sample_normal$`ng/mL` <- CHARM_sample_normal$`DNA yield (ng)` / CHARM_sample_normal$`Original Plasma Volume (ml)`
+CHARM_sample_normal$group_id <- CHARM_sample_normal$group_id
+
+# Select and rename columns to match DNA_ext_w_sample_info_plasma
+healthy_df <- CHARM_sample_normal[, c("group_id", "ng/mL")]
+healthy_df$cancer_status <- "control"
+healthy_df$sex <- NA
+
+# Combine with diseased cohort
+combined_df <- rbind(DNA_ext_w_sample_info_plasma, healthy_df)
+
+# Calculate overall median and SD
+overall_median <- median(combined_df$`ng/mL`, na.rm = TRUE)
+overall_sd <- sd(combined_df$`ng/mL`, na.rm = TRUE)
+
+# Output the result
+cat(sprintf("Across all samples (diseased and healthy), the DNA extraction yielded a median of %.1f ng/mL of plasma (SD = %.1f).\n",
+            overall_median, overall_sd))
+```
+
+
+### Doing it without the male, cancer positive samples with high ng/ml LIB-04-0543-T0
+```{r}
+# Filter out outlier
+DNA_ext_HBOC <- subset(DNA_ext_w_sample_info_plasma, group_id != "LIB-04-0543-T0")
+
+# Overall
+overall_median <- median(DNA_ext_HBOC$`ng/mL`, na.rm = TRUE)
+overall_sd <- sd(DNA_ext_HBOC$`ng/mL`, na.rm = TRUE)
+
+# Cancer-negative
+neg <- DNA_ext_HBOC[DNA_ext_HBOC$cancer_status == "negative", ]
+neg_median <- median(neg$`ng/mL`, na.rm = TRUE)
+neg_sd <- sd(neg$`ng/mL`, na.rm = TRUE)
+
+# Cancer-positive
+pos <- DNA_ext_HBOC[DNA_ext_HBOC$cancer_status == "positive", ]
+pos_median <- median(pos$`ng/mL`, na.rm = TRUE)
+pos_sd <- sd(pos$`ng/mL`, na.rm = TRUE)
+
+# Male BRCA1/2m-carriers (from full HBOC cohort)
+male <- DNA_ext_HBOC[DNA_ext_HBOC$sex == "male", ]
+male_median <- median(male$`ng/mL`, na.rm = TRUE)
+male_sd <- sd(male$`ng/mL`, na.rm = TRUE)
+
+# Female BRCA1/2m-carriers (from full HBOC cohort)
+female <- DNA_ext_HBOC[DNA_ext_HBOC$sex == "female", ]
+female_median <- median(female$`ng/mL`, na.rm = TRUE)
+female_sd <- sd(female$`ng/mL`, na.rm = TRUE)
+
+# Output
+cat(sprintf(
+  "DNA extraction yielded a median of %.1f ng/mL of plasma (SD = %.1f) with no difference detected between cancer-negative (median = %.1f, SD = %.1f) and cancer-positive (median = %.1f, SD = %.1f) BRCA1/2m-carriers, male (median = %.1f, SD = %.1f) and female (median = %.1f, SD = %.1f) BRCA1/2m-carriers.\n",
+  overall_median, overall_sd,
+  neg_median, neg_sd,
+  pos_median, pos_sd,
+  male_median, male_sd,
+  female_median, female_sd
+))
+```
+
+```{r}
+# Define output path
+outfile <- file.path(outdir, "01_DNA_extraction_info.csv")
+
+# Write the dataframe to a CSV file
+write.csv(combined_df, file = outfile, row.names = FALSE)
+```

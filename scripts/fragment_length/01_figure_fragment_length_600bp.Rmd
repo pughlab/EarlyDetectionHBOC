@@ -1,0 +1,582 @@
+
+# Import Data 
+```{r}
+# Load libraries
+library(dplyr)
+library(matrixStats)
+library(ggplot2)
+library(cowplot)
+library(readxl)
+library(ggpubr)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())  # project root
+date <- Sys.Date()
+```
+
+```{r}
+# Output directory for figures
+data_outdir <- here::here("figures", "fragment_length")
+
+# Input metadata file
+samples_file <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+# Import data
+samples <- read_excel(samples_file, sheet = "April22")
+
+# Remove failed samples
+failed_samples <- c("CHARMQ_0788_Pl_T_PG_T-788", "CHARMQ_0207_Pl_T_PG_T-207")
+samples <- samples[!samples$`Library Name` %in% failed_samples, ]
+
+# Control with serial samples
+normal_freq <- here::here("data", "HBOC_pipeline_output", "control", "control_insert_size_count.csv")
+
+# HBOC frequency data
+frequency <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_insert_size_count.csv")
+
+# Load frequency data
+data_frequency <- read.csv(frequency, check.names = FALSE)
+data_normal <- read.csv(normal_freq, check.names = FALSE)
+
+# Remove failed samples from data
+data_frequency <- data_frequency[, !colnames(data_frequency) %in% failed_samples]
+
+print(data_outdir)
+```
+
+
+# Analysis of HBOC
+```{r}
+# Filter data for fragment length range (10-320bp)
+data_frequency <- data_frequency %>% dplyr::filter(insert_size %in% 10:600)
+data_normal <- data_normal %>% dplyr::filter(insert_size %in% 10:600)
+
+# Step 2: Set insert_size as rownames and remove it from the columns
+rownames(data_frequency) <- data_frequency$insert_size
+data_frequency <- data_frequency[, !colnames(data_frequency) %in% c("insert_size")]
+
+rownames(data_normal) <- data_normal$insert_size
+data_normal <- data_normal[, !colnames(data_normal) %in% c("insert_size")]
+
+# Extract library names from data_frequency
+library_names <- colnames(data_frequency)
+
+# Filter samples DataFrame to match library names
+samples <- samples %>%
+  dplyr::filter(`Library Name` %in% library_names)
+
+# combine fragment count raw
+data_combined_raw <- cbind(data_frequency, data_normal)
+```
+
+```{r}
+data_frequency <- apply(data_frequency,2, function(x) x/sum(x)*100)
+data_normal <- apply(data_normal,2, function(x) x/sum(x)*100)
+```
+
+# Merge clinical info of Data cohort and Normal Cohort into one Dataframe 
+```{r}
+# Merge data of normal and data cohort 
+merged_insert_size <- cbind(data_frequency, data_normal)
+```
+
+```{r}
+# Add 'cohort' column to HBOC samples
+data_samples <- samples[, c("Library Name", "cancer_status", "survivor", "source")]
+data_samples$cohort <- "HBOC"
+
+# Create normal sample metadata with 'cohort' = 'normal'
+normal_samples <- data.frame(
+  "Library Name" = colnames(data_normal),
+  cancer_status = "normal",
+  survivor = NA,
+  source = "normal",
+  cohort = "normal",
+  check.names = FALSE
+)
+
+# Reorder columns to match data_samples
+normal_samples <- normal_samples[, names(data_samples)]
+
+# Merge
+merged_sample_info <- rbind(data_samples, normal_samples)
+```
+
+# Function to calculate medians for groups 
+```{r}
+# Function to calculate mode
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+unique_source <- unique(merged_sample_info$source)
+
+calculate_median <- function(merged_sample_info, merged_insert_size) {
+  unique_source <- unique(merged_sample_info$source)
+  medians <- list()
+
+  for (group in unique_source) {
+    cohort <- merged_sample_info[merged_sample_info$source == group, ]
+    
+    # get the dataframe of normalized frequencies for the specific group - used for plot
+    data_cohort <- merged_insert_size[, colnames(merged_insert_size) %in% cohort$'Library Name']
+    # View(data_cohort)
+    median_group <- rowMedians(as.matrix(data_cohort))
+    # get the dataframe of read count for the specific group 
+    # data_cohort_raw <- data_combined_raw[, colnames(merged_insert_size) %in% cohort$'Library Name']
+    # group_medians <- rowMedians(as.matrix(data_cohort_raw))
+    #View(group_medians)
+    medians[[group]] <- list(
+      
+      median = rowMedians(as.matrix(data_cohort)),
+      mean = rowMeans(as.matrix(data_cohort)),
+      sd = rowSds(as.matrix(data_cohort)),
+      
+      meanfrag <- mean(rep(c(10:600), round(median_group *1000000, 0))),
+      medfrag <- median(rep(c(10:600), round(median_group*1000000, 0))),
+      modefrag <- getmode(rep(c(10:600), round(median_group*1000000, 0)))
+    )
+  }
+  return(medians)
+}
+```
+
+# Calculate medians for all five groups
+```{r}
+# Calculate medians for all five groups
+groups <- c("first_positive_survivor_no", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "cancer_status_positive_survivor_yes", "normal")
+medians <- calculate_median(merged_sample_info, merged_insert_size)
+
+```
+
+# Function to calculate mean, median, and mode fragment lengths
+
+```{r}
+# Calculate means, medians, and modes for all five groups
+#groups <- c("normal")
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+calculate_metrics <- function(groups, medians, merged_sample_info){
+  
+  for (group in groups){ 
+    # medians[[group]][["meanfrag"]] <- mean(rep(c(10:600)))
+    # medians[[group]][["medfrag"]] <- median(rep(c(10:600)))
+    # medians[[group]][["modefrag"]] <- getmode(rep(c(10:600)))
+    # Getting the number of samples for each group 
+    medians[[group]]["group_size"] <- nrow(merged_sample_info[merged_sample_info$source == group, ])
+    }
+  return(medians)
+}
+
+```
+
+# Calculate means, medians, and modes for all five groups
+```{r}
+medians <- calculate_metrics(groups, medians, merged_sample_info)
+```
+
+# For statistical purposes only 
+```{r}
+# ==================================== For statistical purposes only ====================================
+calculate_medfrag_only <- function(groups, merged_sample_info, merged_insert_size) {
+  medfrag_list <- numeric(length(groups))
+  names(medfrag_list) <- groups
+
+  for (group in groups) {
+    # Get sample IDs in the group
+    cohort <- merged_sample_info[merged_sample_info$cohort == group, ]
+    sample_names <- cohort$`Library Name`
+
+    # Subset the frequency matrix
+    data_cohort <- merged_insert_size[, colnames(merged_insert_size) %in% sample_names, drop = FALSE]
+
+    # Row medians of fragment frequencies
+    median_freq <- rowMedians(as.matrix(data_cohort))
+
+    # Convert to true fragment length distribution (weighted)
+    medfrag_list[group] <- median(rep(10:600, round(median_freq * 1000000)))
+  }
+
+  return(medfrag_list)
+}
+
+groups <- c("HBOC", "normal") 
+
+medfrag_summary <- calculate_medfrag_only(groups, merged_sample_info, merged_insert_size)
+
+# View result
+print(medfrag_summary)
+
+# ==================================== For statistical purposes only ====================================
+```
+
+# Comparisons
+```{r}
+get_z_score <- function(group1, group2){ 
+  z_score <- (medians[[group1]][["median"]] - medians[[group2]][["median"]]) / sqrt(((medians[[group1]][["sd"]]^2) / medians[[group1]][["group_size"]]) + ((medians[[group2]][["sd"]]^2) / medians[[group2]][["group_size"]]))
+return(z_score)
+}
+```
+
+# Get_z_scores
+```{r}
+normal_vs_first_positive_survivor_no <- get_z_score("first_positive_survivor_no","normal")
+normal_vs_cancer_status_negative_survivor_no <- get_z_score("cancer_status_negative_survivor_no","normal")
+first_positive_survivor_no_vs_cancer_status_negative_survivor_no <- get_z_score("first_positive_survivor_no", "cancer_status_negative_survivor_no")
+hboc_positive_survivor_yes_vs_cancer_status_negative_survivor_no <- get_z_score("cancer_status_negative_survivor_yes", "cancer_status_negative_survivor_no")
+```
+
+
+
+# Create data for plotting
+```{r}
+# Create data for plotting
+lengths <- 10:600
+data <- data.frame(
+  length = lengths,
+  normal_median = medians[["normal"]][["median"]],
+  first_positive_survivor_no_median = medians[["first_positive_survivor_no"]][["median"]],
+  cancer_status_negative_survivor_no_median = medians[["cancer_status_negative_survivor_no"]][["median"]],
+  cancer_status_negative_survivor_yes_median = medians[["cancer_status_negative_survivor_yes"]][["median"]],
+  cancer_status_positive_survivor_yes_median = medians[["cancer_status_positive_survivor_yes"]][["median"]],
+  #cancer_positive_lfs = median_frequencies_lfs$positive_median, 
+  #cancer_negative_lfs = median_frequencies_lfs$negative_median, 
+  normal_vs_first_positive_survivor_no, 
+  normal_vs_cancer_status_negative_survivor_no, 
+  first_positive_survivor_no_vs_cancer_status_negative_survivor_no)
+
+```
+
+```{r}
+data$colors_z_score_normal_vs_first_positive_survivor_no <- ifelse(data$normal_vs_first_positive_survivor_no > 0, "red", "blue")
+data$colors_z_score_normal_vs_cancer_status_negative_survivor_no <- ifelse(data$normal_vs_cancer_status_negative_survivor_no > 0, "red", "blue")
+
+data$colors_z_score_first_positive_survivor_no_vs_cancer_status_negative_survivor_no <- ifelse(data$first_positive_survivor_no_vs_cancer_status_negative_survivor_no > 0, "red", "blue")
+### Set facets
+data$size <- ifelse(data$length <= 89, "1",
+                    ifelse(data$length >=90 & data$length <=150, "2",
+                           ifelse(data$length >=151 & data$length <=220, "3", "4")))
+data$size <- factor(data$size,
+                    levels = c("1", "2", "3", "4"),
+                    labels = c("10-89bp", "90-150bp", "151-220bp", "221-320bp"))
+```
+
+# Plotting
+```{r}
+plot_freq_median <- ggplot(data) +
+  geom_line(aes(length, y = first_positive_survivor_no_median, color = "Cancer Positive (First Positive)"), size = 1.2) +
+  geom_line(aes(length, y = cancer_status_negative_survivor_no_median, color = "Cancer Negative (Survivor No)"), size = 1.2) +
+  geom_line(aes(length, y = cancer_status_negative_survivor_yes_median, color = "Cancer Negative (Survivor Yes)"), size = 1.2) +
+  geom_line(aes(length, y = cancer_status_positive_survivor_yes_median, color = "Cancer Positive (Survivor Yes)"), size = 1.2) +
+  geom_line(aes(length, y = normal_median, color = "Healthy"), size = 1.2) +
+  ggtitle("Median Fragment Frequency Distribution") +
+  xlab("") +
+  ylab("Frequency (%)") +
+  theme(
+   legend.position = "top",
+    legend.key = element_blank(),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.key.width = unit(1, "lines"),      # Reduce width of keys
+    legend.spacing.x = unit(0, "lines"),    # Reduce horizontal spacing between items
+    legend.margin = margin(0, 0, 0, 0),       # Remove legend margin
+    legend.box.margin = margin(0, 0, 0, 0),    # Remove legend box margin
+    # legend.justification = "left", 
+    # legend.box.just = "left", 
+    panel.background = element_blank(),
+    panel.grid.major = element_line(color = "gray95"),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16,  hjust = 0.5)
+  ) +
+  scale_color_manual(
+    name = " ",
+    values = c(
+      "Healthy" = "#2ca02c",
+      "Cancer Positive (First Positive)" = "#f87544",
+      "Cancer Negative (Survivor No)" = "#9467bd",
+      "Cancer Negative (Survivor Yes)" = "#1f77b4",
+      "Cancer Positive (Survivor Yes)" = "#f4c842"
+    )
+  ) +
+  guides(color = guide_legend(override.aes = list(linewidth = 5, size = 3))) +
+  scale_x_continuous(
+    breaks = seq(0, 600, 25)
+  )
+
+plot_freq_median
+```
+
+```{r}
+plot_inset <- ggplot(data) +
+  #geom_line(aes(length, y = cancer_positive_lfs, color = "LFS Positive"), linewidth = 1) +
+  # geom_line(aes(length, y = cancer_negative_lfs, color = "LFS Negative"), linewidth = 1) +
+  geom_line(aes(length, y = first_positive_survivor_no_median, color = "Cancer Positive (First Positive)"), linewidth = 1) +
+  geom_line(aes(length, y = cancer_status_negative_survivor_no_median, color = "Cancer Negative (Survivor No)"), linewidth = 1) +
+  geom_line(aes(length, y = cancer_status_negative_survivor_yes_median, color = "Cancer Negative (Survivor Yes)"), linewidth = 1) +
+  geom_line(aes(length, y = cancer_status_positive_survivor_yes_median, color = "Cancer Positive (Survivor Yes)"), linewidth = 1) +
+  geom_line(aes(length, y = normal_median, color = "Healthy"), linewidth = 1) +
+  ggtitle("") +
+  xlab("Fragment Length (bp)") +  # Add x-axis label
+  ylab("") +  # No y-axis label
+  theme(
+    legend.position = "none",
+    legend.key = element_blank(),
+    plot.margin = margin(-0.5, 0, -0.5, -0.5, "cm"),
+    axis.text = element_text(size = 13),  # Adjust size for axis text
+    axis.ticks.x = element_line(size = 0.5),  # Add axis ticks
+    axis.ticks.y = element_blank(),  # Add axis ticks
+    axis.text.y = element_blank(),  # Add axis ticks
+    axis.title.x = element_blank(),  # Add axis ticks
+    panel.background = element_blank(),
+    panel.grid.major = element_line(color = "gray95"), 
+    panel.border = element_rect(color = "black", fill = NA, size = 1)
+  ) +
+  scale_color_manual(
+    name = " ",
+    values = c(
+      "Healthy" = "#2ca02c",
+      "Cancer Positive (First Positive)" = "#f87544",
+      "Cancer Negative (Survivor No)" = "#9467bd",
+      "Cancer Negative (Survivor Yes)" = "#1f77b4",
+      "Cancer Positive (Survivor Yes)" = "#f4c842"
+      #"LFS Positive" = "black",
+      #"LFS Negative" = "red"
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(100, 170),  # Set x-axis range
+    breaks = seq(100, 170, by = 10),  # Add ticks every 5 bp
+    expand = c(0, 0)  # Remove padding
+  ) +
+  scale_y_continuous(limits = c(0, 2.7), expand = c(0, 0))
+
+# Display the plot
+plot_inset
+```
+
+```{r}
+#ggsave("/Users/erikensminger/Documents/GitHub_Repos/HBOC_manuscript/figures/insert_size/frag_freq_distribution_median_600bp.pdf", plot_freq_median,  width = 15, height = 5)
+
+```
+
+
+# Plotting z-scores 
+```{r}
+plot_positive <- ggplot(data) +
+  geom_bar(aes(length, normal_vs_first_positive_survivor_no, fill = colors_z_score_normal_vs_first_positive_survivor_no), stat="identity") +
+  ggtitle("Cancer Positive (First Positive) vs Healthy Control") +
+  xlab("Fragment Size") + 
+  ylab("Z-score") +
+  #facet_grid(.~size, scales = "free", space = "free") +
+  scale_fill_manual(values = c("#A6CEE3", "#FB9A99")) +
+  theme(strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    panel.background = element_blank(),
+    panel.grid.major = element_line(color = "gray95"),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 14)
+    ) +
+  guides(fill = FALSE) + 
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600)) +
+  scale_y_continuous(limits=c(-12, 10), expand = c(0,0))
+plot_positive
+```
+
+
+# Plotting z-scores 
+```{r}
+plot_previvor <- ggplot(data) +
+  geom_bar(aes(length, normal_vs_cancer_status_negative_survivor_no, fill = colors_z_score_normal_vs_cancer_status_negative_survivor_no), stat="identity") +
+  ggtitle("Cancer Negative (Survivor No) vs Healthy Control") +
+  xlab("Fragment Size") + 
+  ylab("Z-score") +
+  #facet_grid(.~size, scales = "free", space = "free") +
+  scale_fill_manual(values = c("#A6CEE3", "#FB9A99")) +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color = "gray95"),
+        axis.text.x = element_text(size = 13),
+        axis.text.y = element_text(size = 13),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        plot.title = element_text(size = 14)
+        ) +
+  guides(fill = FALSE) + 
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600)) +
+  scale_y_continuous(limits=c(-15, 11), expand = c(0,0))
+plot_previvor
+```
+
+# Plotting z-scores 
+```{r}
+plot_first_positive_vs_HBOC_healthy <- ggplot(data) +
+  geom_bar(aes(length, first_positive_survivor_no_vs_cancer_status_negative_survivor_no, fill = colors_z_score_first_positive_survivor_no_vs_cancer_status_negative_survivor_no), stat="identity") +
+  ggtitle("Cancer Positive (First Positive) vs Cancer Negative (Survivor No)") +
+  xlab("Fragment Size") + 
+  ylab("Z-score") +
+  #facet_grid(.~size, scales = "free", space = "free") +
+  scale_fill_manual(values = c("#A6CEE3", "#FB9A99")) +
+  theme(strip.background = element_blank(),
+        panel.background = element_blank(),
+         panel.grid.major = element_line(color = "gray95"),
+        strip.text.x = element_blank()) +
+  guides(fill = FALSE) + 
+  scale_x_continuous(breaks = c(0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600)) +
+  scale_y_continuous(limits=c(-5, 5), expand = c(0,0))
+plot_first_positive_vs_HBOC_healthy
+```
+
+```{r}
+#ggsave(path = "/Users/erikensminger/Documents/GitHub_Repos/HBOC_manuscript/figures/insert_size/plot_HBOC_WGS_insert_size_groups_600bp", filename = paste0("insert_size", ".png"),plot , width = 18, height = 16.5)
+```
+
+
+```{r}
+Figure <- ggarrange(plot_freq_median + theme(axis.text.x = element_blank(),
+                                      axis.ticks.x = element_blank(),
+                                      axis.title.x = element_blank()),
+                    plot_positive + theme(axis.text.x = element_blank(),
+                                          axis.ticks.x = element_blank(),
+                                          axis.title.x = element_blank()), 
+                    plot_previvor, 
+                    # + theme(axis.text.x = element_blank(),
+                    #                       axis.ticks.x = element_blank(),
+                    #                       axis.title.x = element_blank()),
+                    # plot_first_positive_vs_HBOC_healthy,
+                    ncol = 1, align = "v", heights = c(1.5, 0.80, 0.80))
+
+plot_combined <- ggdraw() +
+  draw_plot(Figure) + 
+  draw_plot(plot_inset, x = 0.45, y = .65, width = .5, height = .25)
+
+plot_combined
+```
+
+```{r}
+ggsave(path = data_outdir, filename = paste0("01_figure_fragment_length_distribution_600bp", ".pdf"),plot_combined , width = 13, height = 11)
+```
+
+
+#Plot individual curves
+
+### Plot individual curves of HBOC and Normal 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Step 1: Prepare `merged_insert_size` into a long format
+insert_size_long <- merged_insert_size %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("length") %>%  # Convert rownames to a column
+  pivot_longer(
+    cols = -length,  # Keep `length` as is; pivot other columns
+    names_to = "Library Name", 
+    values_to = "Frequency"
+  )
+
+# Step 2: Filter `merged_sample_info` for matching `Library Name`
+merged_sample_info_filtered <- merged_sample_info %>%
+  dplyr::filter(`Library Name` %in% unique(insert_size_long$`Library Name`))
+
+
+
+# Step 3: Join `merged_sample_info` with the long-format `insert_size_long`
+plot_data <- insert_size_long %>%
+  inner_join(merged_sample_info_filtered, by = "Library Name")
+
+plot_data$source <- factor(
+  plot_data$source, 
+  levels = c(
+    "first_positive_survivor_no", 
+    "cancer_status_negative_survivor_no", 
+    "cancer_status_negative_survivor_yes", 
+    "cancer_status_positive_survivor_yes", 
+    "normal"
+  ),
+  labels = c(
+    "Cancer Positive (First Positive)", 
+    "Cancer Negative (Survivor No)", 
+    "Cancer Negative (Survivor Yes)", 
+    "Cancer Positive (Survivor Yes)", 
+    "Healthy Control"
+  )
+)
+
+```
+
+```{r}
+# Create a dummy data frame for the vertical line
+vline_data <- data.frame(
+  xintercept = 167,
+  label = "Threshold (167 bp)"
+)
+
+plot_individual_samples <- ggplot() +
+  # Black lines for individual fragment length distributions
+  geom_line(data = plot_data, aes(x = as.numeric(length), y = Frequency, group = `Library Name`, color = "Fragment Length Frequencies"), alpha = 0.6) +
+  # Red line for healthy median
+  geom_line(data = data, aes(x = length, y = normal_median, color = "Healthy Median"), size = 1) +
+  # Add vertical blue dashed line using dummy data
+  geom_vline(data = vline_data, aes(xintercept = xintercept, color = label), linetype = "dashed", size = 0.8) +
+  facet_wrap(~source, scales = "fixed", ncol = 2) +  # Facet by group with consistent y-axis
+  ggtitle("Individual Fragment Frequency Distribution by Cancer Group") +
+  xlab("Fragment Length (bp)") +
+  ylab("Frequency (%)") +
+  theme(
+    legend.position = "top",  # Position the legend at the top
+    legend.key = element_blank(),
+    legend.text = element_text(size = 13),       # Increase legend text size
+    legend.title = element_blank(),      # Increase legend title size
+    panel.background = element_blank(),
+    panel.grid.major = element_line(color = "gray95"),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 14, face = "bold"),  # Style facet titles
+    axis.text.y = element_text(size = 13),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 13), 
+    axis.title.x = element_text(size = 14), 
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5)  # Increase and center title
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 600, by = 25),  # Tick marks every 10
+    limits = c(10, 600)  # Set x-axis range from 10 to 600
+  ) +
+  # Define manual colors for the legend
+  scale_color_manual(
+    name = "Legend",  # Title of the legend
+    values = c(
+      "Healthy Median" = "red",
+      "Fragment Length Frequencies" = "black",
+      "Threshold (167 bp)" = "blue"
+    )
+  ) +
+guides(color = guide_legend(override.aes = list(linewidth = 5, size = 3)))  # Adjust thickness here
+
+
+# Step 6: Print the plot
+print(plot_individual_samples)
+```
+
+```{r}
+ggsave(
+  path = data_outdir, 
+  filename = paste0("01_figure_fragment_length_distributions_by_group", ".pdf"),
+  plot = plot_individual_samples,  # Replace with your plot object
+  width = 14,  # 4 inches per column
+  height = 6  # 4 inches per row
+)
+```

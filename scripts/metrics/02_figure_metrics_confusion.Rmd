@@ -1,0 +1,848 @@
+---
+title: "02_figure_metrics_confusion"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(reshape2)
+library(ggformula)
+library(signal)
+library(matrixStats)
+library(lemon)
+library(ggpubr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(combinat)  # optional, for clarity
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+```{r}
+# Define output directories
+outdir_figures <- here::here("figures", "metrics")
+outdir_figures_negatives_only <- here::here("figures", "metrics", "02_negative_only")
+outdir_figures_pos_vs_neg <- here::here("figures", "metrics", "02_pos_vs_neg")
+outdir_data <- here::here("data", "metrics")
+
+# Create directories if they do not exist
+for (dir in c(outdir_figures, outdir_figures_negatives_only, outdir_figures_pos_vs_neg, outdir_data)) {
+  if (!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+}
+```
+
+```{r}
+# read in data 
+scores_path <- here::here("data", "metrics", "01_metrics_integrated_cleaned.csv")
+valid_samples <- read.csv(scores_path, header=TRUE, check.names=FALSE)
+
+# Summarize cancer-negative samples
+cancer_negative <- valid_samples[valid_samples$cancer_status == "negative", ]
+```
+
+
+```{r}
+confusion_matrix_samples <- function(data, signal_threshold = NULL, metric_col = NULL) {
+  library(ggplot2)
+  library(dplyr)
+
+  df <- data
+
+  if (!is.null(signal_threshold)) {
+    df$signal_status <- df$n_signals >= signal_threshold
+  } else if (!is.null(metric_col)) {
+    df$signal_status <- df[[metric_col]]
+  } else {
+    stop("Provide either signal_threshold or metric_col.")
+  }
+
+  df$months_numeric <- suppressWarnings(as.numeric(df$months_to_positive))
+
+  df$outcome <- with(df, ifelse(
+    signal_status & !is.na(months_numeric), "TP",
+    ifelse(signal_status & is.na(months_numeric), "FP",
+    ifelse(!signal_status & !is.na(months_numeric) & months_numeric <= 12, "FN", "TN")
+  )))
+
+  conf_counts <- table(factor(df$outcome, levels = c("TP", "FP", "FN", "TN")))
+  TP <- conf_counts["TP"]; FP <- conf_counts["FP"]
+  FN <- conf_counts["FN"]; TN <- conf_counts["TN"]
+
+  PPV <- round(100 * TP / (TP + FP), 2)
+  NPV <- round(100 * TN / (TN + FN), 2)
+  Sensitivity <- round(100 * TP / (TP + FN), 2)
+  Specificity <- round(100 * TN / (TN + FP), 2)
+
+  plot_df <- data.frame(
+    Clinical = factor(c("Positive", "Negative", "Positive", "Negative"), levels = c("Positive", "Negative")),
+    Plasma   = factor(c("Positive", "Positive", "Negative", "Negative"), levels = c("Positive", "Negative")),
+    label    = c("TP", "FP", "FN", "TN"),
+    Y        = c(TP, FP, FN, TN),
+    color    = c("good", "bad", "bad", "good")
+  )
+
+  row_totals <- c(sum(plot_df$Y[1:2]), sum(plot_df$Y[3:4]))
+  plot_df$percent <- c(
+    round(100 * plot_df$Y[1] / row_totals[1], 2),
+    round(100 * plot_df$Y[2] / row_totals[1], 2),
+    round(100 * plot_df$Y[3] / row_totals[2], 2),
+    round(100 * plot_df$Y[4] / row_totals[2], 2)
+  )
+
+  plot_df$label_text <- paste0(
+    dplyr::recode(plot_df$label,
+           TP = "TP", FP = "FP",
+           FN = "FN", TN = "TN"),
+    "\n(", plot_df$Y, ")\n", plot_df$percent, "%"
+  )
+
+  plot <- ggplot(plot_df, aes(x = Clinical, y = Plasma)) +
+    geom_tile(aes(fill = color), color = "black", size = 1.2, alpha = 0.9) +
+    geom_text(aes(label = label_text), size = 4.5, fontface = "bold") +
+    scale_fill_manual(values = c("good" = "#b3cde3", "bad" = "#fbb4ae")) +
+    xlab(paste0(
+      "Clinical Finding\n\n",
+      "Sensitivity = ", Sensitivity, "%\n",
+      "Specificity = ", Specificity, "%\n",
+      "PPV = ", PPV, "%\n",
+      "NPV = ", NPV, "%"
+    )) +
+    ylab("Plasma Finding") +
+    ggtitle("BRCA1/2m-carriers: Cancer-Free Samples") +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold", size = 13.5),
+      axis.title.x = element_text(face = "bold", size = 12.5),
+      axis.title.y = element_text(face = "bold", size = 12.5),
+      axis.text.x    = element_text(size = 10, color = "black"), 
+      axis.text.y    = element_text(size = 10, angle = 90, hjust = 0.5, color = "black"),  
+      axis.ticks.length = unit(0.15, "cm"), 
+      legend.position = "none"
+    )
+
+  return(list(
+    counts      = conf_counts,
+    PPV         = PPV,
+    NPV         = NPV,
+    Sensitivity = Sensitivity,
+    Specificity = Specificity,
+    plot        = plot,
+    samples     = list(
+      TP = df$group_id[df$outcome == "TP"],
+      FP = df$group_id[df$outcome == "FP"],
+      FN = df$group_id[df$outcome == "FN"],
+      TN = df$group_id[df$outcome == "TN"]
+    )
+  ))
+}
+```
+
+
+```{r}
+confusion_matrix_patients <- function(data, signal_threshold = NULL, metric_col = NULL) {
+  library(ggplot2)
+  library(dplyr)
+
+  df <- data
+
+  if (!is.null(signal_threshold)) {
+    df$signal_status <- df$n_signals >= signal_threshold
+  } else if (!is.null(metric_col)) {
+    df$signal_status <- df[[metric_col]]
+  } else {
+    stop("Provide either signal_threshold or metric_col.")
+  }
+
+  df$months_numeric <- suppressWarnings(as.numeric(df$months_to_positive))
+
+  # Subset into signal positive and negative
+  df_pos <- df[df$signal_status, ]
+  df_neg <- df[!df$signal_status, ]
+
+  # Define patient-level groups
+  tp_ids <- unique(df_pos$LIB_ID[!is.na(df_pos$months_numeric)])
+  fp_ids <- setdiff(unique(df_pos$LIB_ID), tp_ids)
+
+  fn_ids <- unique(df_neg$LIB_ID[!is.na(df_neg$months_numeric) & df_neg$months_numeric <= 12])
+  tn_ids <- setdiff(unique(df_neg$LIB_ID), fn_ids)
+
+  # Counts
+  TP <- length(tp_ids); FP <- length(fp_ids)
+  FN <- length(fn_ids); TN <- length(tn_ids)
+
+  # Metrics
+  PPV <- round(100 * TP / (TP + FP), 2)
+  NPV <- round(100 * TN / (TN + FN), 2)
+  Sensitivity <- round(100 * TP / (TP + FN), 2)
+  Specificity <- round(100 * TN / (TN + FP), 2)
+
+  # Proper confusion matrix layout
+  plot_df <- data.frame(
+    Clinical = factor(c("Positive", "Negative", "Positive", "Negative"), levels = c("Positive", "Negative")),
+    Plasma   = factor(c("Positive", "Positive", "Negative", "Negative"), levels = c("Positive", "Negative")),
+    label    = c("TP", "FP", "FN", "TN"),
+    Y        = c(TP, FP, FN, TN),
+    color    = c("good", "bad", "bad", "good")
+  )
+
+  # Row-wise percentages
+  row_totals <- c(sum(plot_df$Y[1:2]), sum(plot_df$Y[3:4]))
+  plot_df$percent <- c(
+    round(100 * plot_df$Y[1] / row_totals[1], 2),
+    round(100 * plot_df$Y[2] / row_totals[1], 2),
+    round(100 * plot_df$Y[3] / row_totals[2], 2),
+    round(100 * plot_df$Y[4] / row_totals[2], 2)
+  )
+
+  # Final label text
+  plot_df$label_text <- paste0(
+    dplyr::recode(plot_df$label,
+           TP = "TP", FP = "FP",
+           FN = "FN", TN = "TN"),
+    "\n(", plot_df$Y, ")\n", plot_df$percent, "%"
+  )
+
+  # Plot
+  plot <- ggplot(plot_df, aes(x = Clinical, y = Plasma)) +
+    geom_tile(aes(fill = color), color = "black", size = 1.2, alpha = 0.9) +
+    geom_text(aes(label = label_text), size = 4.5, fontface = "bold") +
+    scale_fill_manual(values = c("good" = "#b3cde3", "bad" = "#fbb4ae")) +
+    xlab(paste0(
+      "Clinical Finding\n\n",
+      "Sensitivity = ", Sensitivity, "%\n",
+      "Specificity = ", Specificity, "%\n",
+      "PPV = ", PPV, "%\n",
+      "NPV = ", NPV, "%"
+    )) +
+    ylab("Plasma Finding") +
+    ggtitle("BRCA1/2m-carriers: Cancer-Free Patients") +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title     = element_text(hjust = 0.5, face = "bold", size = 13.5),
+      axis.title.x   = element_text(face = "bold", size = 12.5),
+      axis.title.y   = element_text(face = "bold", size = 12.5),
+      axis.text.x    = element_text(size = 10, color = "black"), 
+      axis.text.y    = element_text(size = 10, angle = 90, hjust = 0.5, color = "black"),  
+      axis.ticks.length = unit(0.15, "cm"), 
+      legend.position = "none"
+    )
+
+  return(list(
+    counts      = c(TP = TP, FP = FP, FN = FN, TN = TN),
+    PPV         = PPV,
+    NPV         = NPV,
+    Sensitivity = Sensitivity,
+    Specificity = Specificity,
+    plot        = plot,
+    patients    = list(
+      TP = tp_ids,
+      FP = fp_ids,
+      FN = fn_ids,
+      TN = tn_ids
+    )
+  ))
+}
+```
+
+```{r}
+res_tf     <- confusion_matrix_samples(cancer_negative, metric_col = "signal_tf")
+res_mut    <- confusion_matrix_samples(cancer_negative, metric_col = "signal_mutation")
+res_nuc    <- confusion_matrix_samples(cancer_negative, metric_col = "signal_nucleosome")
+res_ratio  <- confusion_matrix_samples(cancer_negative, metric_col = "signal_fragment_ratio")
+res_length <- confusion_matrix_samples(cancer_negative, metric_col = "signal_fragment_length")
+res_griffin <- confusion_matrix_samples(cancer_negative, metric_col = "signal_griffin")
+res_sig1   <- confusion_matrix_samples(cancer_negative, signal_threshold = 1)
+res_sig2   <- confusion_matrix_samples(cancer_negative, signal_threshold = 2)
+res_sig3   <- confusion_matrix_samples(cancer_negative, signal_threshold = 3)
+```
+
+```{r}
+res_tf_p     <- confusion_matrix_patients(cancer_negative, metric_col = "signal_tf")
+res_mut_p    <- confusion_matrix_patients(cancer_negative, metric_col = "signal_mutation")
+res_nuc_p    <- confusion_matrix_patients(cancer_negative, metric_col = "signal_nucleosome")
+res_ratio_p  <- confusion_matrix_patients(cancer_negative, metric_col = "signal_fragment_ratio")
+res_length_p <- confusion_matrix_patients(cancer_negative, metric_col = "signal_fragment_length")
+res_griffin_p <- confusion_matrix_patients(cancer_negative, metric_col = "signal_griffin")
+res_sig1_p   <- confusion_matrix_patients(cancer_negative, signal_threshold = 1)
+res_sig2_p   <- confusion_matrix_patients(cancer_negative, signal_threshold = 2)
+res_sig3_p   <- confusion_matrix_patients(cancer_negative, signal_threshold = 3)
+```
+
+```{r}
+#–– Assuming you have defined outdir_data earlier, e.g.
+# outdir_data <- "/path/to/your/output/directory"
+
+#–– Create the directory if it doesn't exist
+if (!dir.exists(outdir_data)) {
+  dir.create(outdir_data, recursive = TRUE)
+}
+
+#–– Build named lists of your results ––
+sample_res <- list(
+  signal_tf             = res_tf,
+  signal_mutation       = res_mut,
+  signal_nucleosome     = res_nuc,
+  signal_fragment_ratio = res_ratio,
+  signal_fragment_length= res_length,
+  signal_griffin        = res_griffin,
+  ">=1_signals"         = res_sig1,
+  ">=2_signals"         = res_sig2,
+  ">=3_signals"         = res_sig3
+)
+
+patient_res <- list(
+  signal_tf             = res_tf_p,
+  signal_mutation       = res_mut_p,
+  signal_nucleosome     = res_nuc_p,
+  signal_fragment_ratio = res_ratio_p,
+  signal_fragment_length= res_length_p,
+  signal_griffin        = res_griffin_p,
+  ">=1_signals"         = res_sig1_p,
+  ">=2_signals"         = res_sig2_p,
+  ">=3_signals"         = res_sig3_p
+)
+
+#–– Function to extract metrics from each result list element ––
+extract_metrics <- function(res) {
+  with(res, data.frame(
+    TP          = as.integer(counts["TP"]),
+    FP          = as.integer(counts["FP"]),
+    FN          = as.integer(counts["FN"]),
+    TN          = as.integer(counts["TN"]),
+    PPV         = PPV,
+    NPV         = NPV,
+    Sensitivity = Sensitivity,
+    Specificity = Specificity,
+    row.names   = NULL
+  ))
+}
+
+#–– Build and write the sample-level summary ––
+sample_summary <- do.call(rbind, lapply(names(sample_res), function(nm) {
+  df <- extract_metrics(sample_res[[nm]])
+  cbind(feature = nm, df)
+}))
+write.csv(
+  sample_summary,
+  file = file.path(outdir_data, "02_metrics_confusion_matrix_negative_samples_summary.csv"),
+  row.names = FALSE
+)
+
+#–– Build and write the patient-level summary ––
+patient_summary <- do.call(rbind, lapply(names(patient_res), function(nm) {
+  df <- extract_metrics(patient_res[[nm]])
+  cbind(feature = nm, df)
+}))
+write.csv(
+  patient_summary,
+  file = file.path(outdir_data, "02_metrics_confusion_matrix_negative_patients_summary.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# cat("Sample-level (group_id):\n")
+# cat("TP:\n"); print(res_sig1$samples$TP)
+# cat("FP:\n"); print(res_sig1$samples$FP)
+# cat("FN:\n"); print(res_sig1$samples$FN)
+# cat("TN:\n"); print(res_sig1$samples$TN)
+# 
+# cat("\nPatient-level (LIB_ID):\n")
+# cat("TP:\n"); print(res_sig1_p$patients$TP)
+# cat("FP:\n"); print(res_sig1_p$patients$FP)
+# cat("FN:\n"); print(res_sig1_p$patients$FN)
+# cat("TN:\n"); print(res_sig1_p$patients$TN)
+```
+
+```{r}
+# Display all sample-level plots
+print(res_tf$plot)
+print(res_mut$plot)
+print(res_nuc$plot)
+print(res_ratio$plot)
+print(res_length$plot)
+print(res_griffin$plot)
+print(res_sig1$plot)
+print(res_sig2$plot)
+print(res_sig3$plot)
+```
+
+```{r}
+# Display all patient-level plots
+print(res_tf_p$plot)
+print(res_mut_p$plot)
+print(res_nuc_p$plot)
+print(res_ratio_p$plot)
+print(res_length_p$plot)
+print(res_griffin_p$plot)
+print(res_sig1_p$plot)
+print(res_sig2_p$plot)
+print(res_sig3_p$plot)
+```
+```{r}
+sample_plots <- list(
+  `Tumour Fraction ` = res_tf$plot      + ggtitle("Tumour Fraction\n(Samples)"),
+  Mutation           = res_mut$plot     + ggtitle("Mutation\n(Samples)"),
+  `Nucleosome Peak`  = res_nuc$plot     + ggtitle("Nucleosome Peak\n(Samples)"),
+  `Fragment Ratio`   = res_ratio$plot   + ggtitle("Fragment Ratio\n(Samples)"),
+  `Fragment Length`  = res_length$plot  + ggtitle("Fragment Length\n(Samples)"),
+  Griffin            = res_griffin$plot + ggtitle("Griffin\n(Samples)"),
+  `1+ Signal`        = res_sig1$plot    + ggtitle(">=1 Signal\n(Samples)"),
+  `2+ Signals`       = res_sig2$plot    + ggtitle(">=2 Signals\n(Samples)"),
+  `3+ Signals`       = res_sig3$plot    + ggtitle(">=3 Signals\n(Samples)")
+)
+
+patient_plots <- list(
+  `Tumour Fraction`   = res_tf_p$plot      + ggtitle("Tumour Fraction\n(Patients)"),
+  Mutation            = res_mut_p$plot     + ggtitle("Mutation\n(Patients)"),
+  `Nucleosome Peak`   = res_nuc_p$plot     + ggtitle("Nucleosome Peak\n(Patients)"),
+  `Fragment Ratio`    = res_ratio_p$plot   + ggtitle("Fragment Ratio\n(Patients)"),
+  `Fragment Length`   = res_length_p$plot  + ggtitle("Fragment Length\n(Patients)"),
+  Griffin             = res_griffin_p$plot + ggtitle("Griffin\n(Patients)"),
+  `1+ Signal`         = res_sig1_p$plot    + ggtitle(">=1 Signal\n(Patients)"),
+  `2+ Signals`        = res_sig2_p$plot    + ggtitle(">=2 Signals\n(Patients)"),
+  `3+ Signals`        = res_sig3_p$plot    + ggtitle(">=3 Signals\n(Patients)")
+)
+```
+
+```{r}
+for (plot_name in names(sample_plots)) {
+  ggsave(
+    filename = file.path(outdir_figures_negatives_only, paste0("02_sample_cancer_negative_only_", gsub(" ", "_", plot_name), ".pdf")),
+    plot = sample_plots[[plot_name]],
+    width = 6,
+    height = 5
+  )
+}
+
+# Save patient plots
+for (plot_name in names(patient_plots)) {
+  ggsave(
+    filename = file.path(outdir_figures_negatives_only, paste0("02_patient_cancer_negative_only_", gsub(" ", "_", plot_name), ".pdf")),
+    plot = patient_plots[[plot_name]],
+    width = 6,
+    height = 5
+  )
+}
+```
+
+```{r}
+add_margin <- function(p) {
+  p + theme(plot.margin = unit(c(1, 0.5, 1, 0.5), "lines"))  # top, right, bottom, left
+}
+
+sample_plots  <- lapply(sample_plots, add_margin)
+patient_plots <- lapply(patient_plots, add_margin)
+
+fig_all <- ggarrange(
+  plotlist = c(sample_plots, patient_plots),
+  nrow = 2,
+  ncol = 9,
+  align = "hv",
+  #labels = c(paste0("Sample-", names(sample_plots)), paste0("Patient-", names(patient_plots))),
+  font.label = list(size = 12, face = "bold")
+)
+```
+
+```{r}
+# Save to file
+ggsave(file.path(outdir_figures_negatives_only, paste0("02_metrics_all_confusion_matrix_negative_only",".pdf")), fig_all, width = 21, height = 8.5)
+
+fig_all
+```
+
+```{r}
+confusion_matrix_two_feature_combinations_with_plot <- function(data, feature_cols) {
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+
+  results <- list()
+  combn_list <- combn(feature_cols, 2, simplify = FALSE)
+
+  for (pair in combn_list) {
+    f1 <- pair[1]
+    f2 <- pair[2]
+    df <- data
+
+    df$signal_status <- df[[f1]] & df[[f2]]
+    df$months_numeric <- suppressWarnings(as.numeric(df$months_to_positive))
+    df$clin_status <- ifelse(df$cancer_status == "positive" |
+                               (!is.na(df$months_numeric) & df$months_numeric <= 12), 
+                             "Positive", "Negative")
+    df$plasma_status <- ifelse(df$signal_status, "Positive", "Negative")
+
+    df$outcome <- with(df, ifelse(
+      plasma_status == "Positive" & clin_status == "Positive", "TP",
+      ifelse(plasma_status == "Positive" & clin_status == "Negative", "FP",
+      ifelse(plasma_status == "Negative" & clin_status == "Positive", "FN", "TN")
+    )))
+
+    conf_counts <- table(factor(df$outcome, levels = c("TP", "FP", "FN", "TN")))
+    TP <- conf_counts["TP"]; FP <- conf_counts["FP"]
+    FN <- conf_counts["FN"]; TN <- conf_counts["TN"]
+    PPV <- round(100 * TP / (TP + FP), 2)
+    NPV <- round(100 * TN / (TN + FN), 2)
+    # Sensitivity and Specificity
+    Sensitivity <- round(100 * TP / (TP + FN), 2)
+    Specificity <- round(100 * TN / (TN + FP), 2)
+
+    plot_df <- data.frame(
+      Clinical = factor(c("Positive", "Negative", "Positive", "Negative"), levels = c("Positive", "Negative")),
+      Plasma   = factor(c("Positive", "Positive", "Negative", "Negative"), levels = c("Positive", "Negative")),
+      label    = c("TP", "FP", "FN", "TN"),
+      Y        = c(TP, FP, FN, TN),
+      color    = c("good", "bad", "bad", "good")
+    )
+
+    row_totals <- c(sum(plot_df$Y[1:2]), sum(plot_df$Y[3:4]))
+    plot_df$percent <- c(
+      round(100 * plot_df$Y[1] / row_totals[1], 2),
+      round(100 * plot_df$Y[2] / row_totals[1], 2),
+      round(100 * plot_df$Y[3] / row_totals[2], 2),
+      round(100 * plot_df$Y[4] / row_totals[2], 2)
+    )
+
+    plot_df$label_text <- paste0(
+      dplyr::recode(plot_df$label,
+                    TP = "True positive", FP = "False positive",
+                    FN = "False negative", TN = "True negative"),
+      "\n(", plot_df$Y, ")\n", plot_df$percent, "%"
+    )
+
+    plot <- ggplot(plot_df, aes(x = Clinical, y = Plasma)) +
+      geom_tile(aes(fill = color), color = "black", size = 1.2, alpha = 0.9) +
+      geom_text(aes(label = label_text), size = 4.5, fontface = "bold") +
+      scale_fill_manual(values = c("good" = "#b3cde3", "bad" = "#fbb4ae")) +
+      xlab(paste0("Clinical Finding\n\n","Sensitivity = ", Sensitivity, "%\n","Specificity = ", 
+                  Specificity, "%\n","PPV = ", PPV, "% | NPV = ", NPV, "%")) +
+      ylab("Plasma Finding") +
+      ggtitle(paste0("Combination: ", f1, " + ", f2)) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_text(face = "bold", color = "black"),
+        axis.title.y = element_text(face = "bold", color = "black"),
+        axis.text = element_text(color = "black"),
+        legend.position = "none"
+      )
+
+    results[[paste(f1, f2, sep = "_AND_")]] <- list(
+      pair = c(f1, f2),
+      counts = conf_counts,
+      PPV = PPV,
+      NPV = NPV,
+      plot = plot,
+      samples = list(
+        TP = df$group_id[df$outcome == "TP"],
+        FP = df$group_id[df$outcome == "FP"],
+        FN = df$group_id[df$outcome == "FN"],
+        TN = df$group_id[df$outcome == "TN"]
+      )
+    )
+  }
+
+  return(results)
+}
+```
+
+```{r}
+feature_cols <- c("signal_nucleosome", "signal_fragment_ratio", "signal_fragment_length",
+                  "signal_griffin", "signal_tf", "signal_mutation")
+
+res_all <- confusion_matrix_two_feature_combinations_with_plot(valid_samples, feature_cols)
+
+# Display all plots
+for (res in res_all) {
+  print(res$plot)
+}
+```
+
+```{r}
+library(ggpubr)
+
+sample_plots <- lapply(names(res_all), function(name) {
+  p <- res_all[[name]]$plot
+  p <- p + ggtitle(paste0(gsub("_AND_", " + ", name), " (Samples)")) +
+          theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+  return(p)
+})
+# Combine into a single figure (adjust nrow/ncol as needed)
+fig_all <- ggarrange(
+  plotlist = sample_plots,
+  nrow = 3,  # 15 plots: try 3 rows x 5 columns
+  ncol = 5,
+  align = "hv",
+  font.label = list(size = 5, face = "bold")
+)
+
+# Optional: save to file
+# ggsave("combined_two_feature_plots.pdf", fig_all, width = 20, height = 12)
+```
+
+```{r}
+# Define output path
+output_path <- file.path(outdir_figures_pos_vs_neg , "02_metrics_combined_two_feature_plots_pos_and_neg.pdf")
+
+# Save the figure
+ggsave(output_path, fig_all, width = 20, height = 12)
+```
+
+
+```{r}
+confusion_matrix_single_and_multifeature_with_plot <- function(data, feature_cols) {
+  library(ggplot2)
+  library(dplyr)
+
+  results <- list()
+
+  # Helper function to compute everything for a given signal_status vector and title
+  get_confusion_result <- function(df, signal_status, title_label) {
+    df$signal_status <- signal_status
+    df$months_numeric <- suppressWarnings(as.numeric(df$months_to_positive))
+
+    df$clin_status <- ifelse(df$cancer_status == "positive" |
+                               (!is.na(df$months_numeric) & df$months_numeric <= 12),
+                             "Positive", "Negative")
+    df$plasma_status <- ifelse(df$signal_status, "Positive", "Negative")
+
+    df$outcome <- with(df, ifelse(
+      plasma_status == "Positive" & clin_status == "Positive", "TP",
+      ifelse(plasma_status == "Positive" & clin_status == "Negative", "FP",
+      ifelse(plasma_status == "Negative" & clin_status == "Positive", "FN", "TN")
+    )))
+
+    conf_counts <- table(factor(df$outcome, levels = c("TP", "FP", "FN", "TN")))
+    TP <- conf_counts["TP"]; FP <- conf_counts["FP"]
+    FN <- conf_counts["FN"]; TN <- conf_counts["TN"]
+    PPV <- round(100 * TP / (TP + FP), 2)
+    NPV <- round(100 * TN / (TN + FN), 2)
+    Sensitivity <- round(100 * TP / (TP + FN), 2)
+    Specificity <- round(100 * TN / (TN + FP), 2)
+
+    plot_df <- data.frame(
+      Clinical = factor(c("Positive", "Negative", "Positive", "Negative"), levels = c("Positive", "Negative")),
+      Plasma   = factor(c("Positive", "Positive", "Negative", "Negative"), levels = c("Positive", "Negative")),
+      label    = c("TP", "FP", "FN", "TN"),
+      Y        = c(TP, FP, FN, TN),
+      color    = c("good", "bad", "bad", "good")
+    )
+
+    row_totals <- c(sum(plot_df$Y[1:2]), sum(plot_df$Y[3:4]))
+    plot_df$percent <- c(
+      round(100 * plot_df$Y[1] / row_totals[1], 2),
+      round(100 * plot_df$Y[2] / row_totals[1], 2),
+      round(100 * plot_df$Y[3] / row_totals[2], 2),
+      round(100 * plot_df$Y[4] / row_totals[2], 2)
+    )
+
+    plot_df$label_text <- paste0(
+      dplyr::recode(plot_df$label,
+                    TP = "TP", FP = "FP",
+                    FN = "FN", TN = "TN"),
+      "\n(", plot_df$Y, ")\n", plot_df$percent, "%"
+    )
+
+    plot <- ggplot(plot_df, aes(x = Clinical, y = Plasma)) +
+      geom_tile(aes(fill = color), color = "black", size = 1.2, alpha = 0.9) +
+      geom_text(aes(label = label_text), size = 4.5, fontface = "bold") + 
+      scale_fill_manual(values = c("good" = "#b3cde3", "bad" = "#fbb4ae")) +
+      xlab(paste0("Clinical Finding\n\n", "Sensitivity = ", Sensitivity, "%\n", 
+                  "Specificity = ", Specificity, "%\n", "PPV = ", PPV, "%\n", "NPV = " , NPV, "%")) +
+      ylab("Plasma Finding") +
+      ggtitle(paste0(title_label, " (Samples)")) +
+        theme_minimal(base_size = 10) +
+        theme(
+          plot.title     = element_text(hjust = 0.5, face = "bold", size = 13.5),
+          axis.title.x   = element_text(face = "bold", size = 12.5),
+          axis.title.y   = element_text(face = "bold", size = 12.5),
+          axis.text.x    = element_text(size = 10, color = "black"), 
+          axis.text.y    = element_text(size = 10, angle = 90, hjust = 0.5, color = "black"),  
+          axis.ticks.length = unit(0.15, "cm"), 
+          legend.position = "none"
+        )
+
+    return(list(
+      name = title_label,
+      counts = conf_counts,
+      PPV = PPV,
+      NPV = NPV,
+      plot = plot,
+      samples = list(
+        TP = df$group_id[df$outcome == "TP"],
+        FP = df$group_id[df$outcome == "FP"],
+        FN = df$group_id[df$outcome == "FN"],
+        TN = df$group_id[df$outcome == "TN"]
+      )
+    ))
+  }
+
+  # Single features
+  for (feature in feature_cols) {
+    signal_status <- data[[feature]]
+    results[[feature]] <- get_confusion_result(data, signal_status, feature)
+  }
+
+  # Multi-feature thresholds
+  for (k in 1:3) {
+    signal_status <- data$n_signals >= k
+    results[[paste0(k, "+ Signals")]] <- get_confusion_result(data, signal_status, paste0("≥", k, " Signals"))
+  }
+
+  return(results)
+}
+```
+
+```{r}
+# Title mapping (cleaned up display names)
+plot_titles <- c(
+  signal_nucleosome      = "Nucleosome Peak",
+  signal_fragment_ratio  = "Fragment Ratio",
+  signal_fragment_length = "Fragment Length",
+  signal_griffin         = "Griffin",
+  signal_tf              = "Tumour Fraction",
+  signal_mutation        = "Mutation",
+  "1+ Signals"           = ">=1 Signal",
+  "2+ Signals"           = ">=2 Signals",
+  "3+ Signals"           = ">=3 Signals"
+)
+
+# Generate the results
+feature_cols <- c(
+  "signal_nucleosome",
+  "signal_fragment_ratio",
+  "signal_fragment_length",
+  "signal_griffin",
+  "signal_tf",
+  "signal_mutation"
+)
+
+res_single_multi <- confusion_matrix_single_and_multifeature_with_plot(valid_samples, feature_cols)
+
+# Format names to match the result list
+names(res_single_multi) <- sub("^([123])\\+ Signals$", "\\1+ Signals", names(res_single_multi))
+
+# Generate plots with nice titles and margins
+sample_plots_all <- lapply(names(res_single_multi), function(name) {
+  clean_title <- plot_titles[[name]]
+  add_margin(
+    res_single_multi[[name]]$plot +
+      ggtitle(paste0(clean_title, "\n(Samples)"))
+      # theme(plot.title = element_text(size = 13, hjust = 0.5, face = "bold"))
+  )
+})
+
+names(sample_plots_all) <- names(res_single_multi)
+
+# Save each plot individually
+for (name in names(sample_plots_all)) {
+  clean_filename <- gsub(" ", "_", tolower(plot_titles[[name]]))
+  ggsave(
+    filename = file.path(outdir_figures_pos_vs_neg, paste0("02_plot_", clean_filename, ".pdf")),
+    plot = sample_plots_all[[name]],
+    width = 6,
+    height = 5
+  )
+}
+
+# Combine into one figure (e.g. 1 row × 9 columns)
+fig_all <- ggarrange(
+  plotlist = sample_plots_all,
+  ncol = 9,
+  nrow = 1,
+  align = "hv"
+)
+
+ggsave(
+  file.path(outdir_figures_pos_vs_neg, "02_metrics_all_single_and_combined_thresholds.pdf"),
+  fig_all,
+  width = 21,
+  height = 4.25
+)
+```
+
+
+```{r}
+export_confusion_matrix_stats <- function(data, feature_cols, outdir, filename = "02_metrics_all_combinations_pos_and_neg_confusion_matrix_OR.csv") {
+  library(dplyr)
+
+  results_list <- list()
+  seen_keys <- character()  # to store hashes of combinations
+
+  # Helper function
+  get_confusion_metrics <- function(df, signal_status, name) {
+    df$signal_status <- signal_status
+    df$months_numeric <- suppressWarnings(as.numeric(df$months_to_positive))
+    df$clin_status <- ifelse(df$cancer_status == "positive" |
+                               (!is.na(df$months_numeric) & df$months_numeric <= 12),
+                             "Positive", "Negative")
+    df$plasma_status <- ifelse(df$signal_status, "Positive", "Negative")
+
+    df$outcome <- with(df, ifelse(
+      plasma_status == "Positive" & clin_status == "Positive", "TP",
+      ifelse(plasma_status == "Positive" & clin_status == "Negative", "FP",
+      ifelse(plasma_status == "Negative" & clin_status == "Positive", "FN", "TN")
+    )))
+
+    conf_counts <- table(factor(df$outcome, levels = c("TP", "FP", "FN", "TN")))
+    TP <- conf_counts["TP"]; FP <- conf_counts["FP"]
+    FN <- conf_counts["FN"]; TN <- conf_counts["TN"]
+
+    Sensitivity <- round(100 * TP / (TP + FN), 2)
+    Specificity <- round(100 * TN / (TN + FP), 2)
+    PPV <- round(100 * TP / (TP + FP), 2)
+    NPV <- round(100 * TN / (TN + FN), 2)
+
+    return(data.frame(
+      Name = paste(name, collapse = " + "),
+      Features = paste(name, collapse = " + "),
+      Num_Features = length(name),
+      TP = TP, FP = FP, FN = FN, TN = TN,
+      Sensitivity = Sensitivity,
+      Specificity = Specificity,
+      PPV = PPV,
+      NPV = NPV
+    ))
+  }
+
+  # Loop through all unique feature combinations
+  for (k in 1:length(feature_cols)) {
+    comb_list <- combn(feature_cols, k, simplify = FALSE)
+
+    for (comb in comb_list) {
+      sorted_comb <- sort(comb)
+      comb_key <- paste(sorted_comb, collapse = "__")  # unique key with stable separator
+
+      if (comb_key %in% seen_keys) next  # skip duplicates
+      seen_keys <- c(seen_keys, comb_key)
+
+      signal_status <- Reduce(`|`, lapply(sorted_comb, function(f) data[[f]]))
+      res <- get_confusion_metrics(data, signal_status, sorted_comb)
+      results_list[[comb_key]] <- res
+    }
+  }
+
+  # Combine and write
+  summary_df <- bind_rows(results_list)
+  write.csv(summary_df, file = file.path(outdir, filename), row.names = FALSE)
+
+  return(summary_df)
+}
+```
+
+```{r}
+feature_cols <- c("signal_nucleosome", "signal_fragment_ratio", "signal_fragment_length",
+                  "signal_griffin", "signal_tf", "signal_mutation")
+
+confusion_stats <- export_confusion_matrix_stats(valid_samples, feature_cols, outdir_data)
+```

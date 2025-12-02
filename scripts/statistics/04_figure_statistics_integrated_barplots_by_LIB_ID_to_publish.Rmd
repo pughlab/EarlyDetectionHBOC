@@ -1,0 +1,656 @@
+---
+title: "04_figure_statistics_integrated_barplots_by_LIB_ID_to_publish"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(lubridate)
+library(stringr)
+library(here)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# out directories 
+outdir      <- here::here("figures", "statistics")
+outdir_data <- here::here("data", "statistics")
+
+scores_path <- here::here("data", "statistics", "02_processing_statistics_integrated_cancer_scores.csv")
+scores <- read.csv(scores_path, header = TRUE, check.names = FALSE)
+
+scores_normal_path <- here::here("data", "statistics", "01_statistics_control_scores.csv")
+scores_normal <- read.csv(scores_normal_path, header = TRUE, check.names = FALSE)
+
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(samples_path, sheet = "April22")
+
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!grepl("T-788-T0", samples$group_id), ]
+samples <- samples[!grepl("T-207-T0", samples$group_id), ]
+```
+
+```{r}
+# ──────────────────────────────────────────────
+# sizing parameters
+# ──────────────────────────────────────────────
+cell_h_cm            <- 1.2   # your heatmap row / anno height
+cell_w_cm            <- 0.35  # your heatmap column / barplot width
+
+# right‐side barplots
+right_bar_width_cm   <- 1    # width of each barplot
+right_text_fontsize  <- 13    # fontsize for percent labels
+right_axis_fontsize  <- 10      # fontsize for barplot axes
+right_gap            <- unit(0.2, "mm")  # gap between the two barplots
+
+# left-side row names font size
+left_label_fontsize <- 13   # or however big you want
+
+# top annotation font size
+top_axis_fontsize <- 13
+
+# row gap 
+row_gap_cm <- 0.1 # 0.1 cm = 1 mm
+# ──────────────────────────────────────────────
+```
+
+# formatting Time_to_next_positive
+```{r}
+# Calculate months_to_positive
+samples$months_to_positive <- ifelse(
+  samples$cancer_status == "positive", 
+  "positive",  # Assign "positive" for positive cases
+  ifelse(
+    samples$Time_to_next_positive %in% c("no_future_cancer", "UNK", "pending"), 
+    samples$Time_to_next_positive,  # Keep special cases as is
+    as.numeric(interval(ymd(samples$date_of_blood), ymd(samples$Time_to_next_positive_dates)) / months(1)) # Calculate months
+  )
+)
+
+# Ensure calculated months are numeric where applicable, retaining special cases as strings
+samples$months_to_positive <- ifelse(
+  samples$months_to_positive %in% c("no_future_cancer", "UNK", "pending", "positive"),
+  samples$months_to_positive,  # Keep as is for special cases and "positive"
+  as.numeric(samples$months_to_positive) # Convert calculated values to numeric
+)
+```
+
+```{r}
+samples <- samples[, c("group_id","Library Name", "TS", "source", "cancer_type", "survivor", "date_of_blood", "months_to_positive")]
+```
+
+```{r}
+data <- merge(samples, scores, by.x = c("group_id", "Library Name", "TS"), by.y = c("group_id", "Library Name", "TS"), all.y = TRUE)
+data <- data %>% dplyr::select(group_id, LIB_ID, `Library Name`, TS, everything())
+
+data$TS[data$TS == "TGL49_0085_Cf_U_PE_4150_WG"] <- ""
+data$TS[data$TS == "TGL49_0291_Pl_T_PE_405_PG"] <- ""
+data$TS[data$TS == "TGL49_0293_Pl_T_PE_385_PG"] <- ""
+data$TS[data$TS == "TGL49_0252_Cf_n_PE_1110_WG"] <- ""
+
+# remove 2 CHARMQ samples
+data <- data[!grepl("T-788-T0", data$group_id), ]
+data <- data[!grepl("T-207-T0", data$group_id), ]
+
+# remove cfMeDIP samples 
+data <- data[!grepl("LIB-04-0649-T0", data$group_id), ]
+data <- data[!grepl("LIB-04-0441-T1", data$group_id), ]
+data <- data[!grepl("LIB-04-0024-T2", data$group_id), ]
+data <- data[!grepl("LIB-04-0131-T0", data$group_id), ]
+```
+
+```{r}
+# group ovarian cancers into "ovarian" 
+data$cancer_type[grepl("hgsoc", data$cancer_type)] <- "ovarian"
+```
+
+```{r}
+# 1) define your mapping once
+mut_map <- c(
+  "Missense_Mutation"                               = "missense",
+  "Nonsense_Mutation"                               = "stop",
+  "Frame_Shift_Ins"                                 = "frameshift",
+  "Frame_Shift_Del"                                 = "frameshift",
+  "Splice_Site"                                     = "splice_site",
+  "Deletion"                                        = "deletion",
+  "Duplication"                                     = "duplication",
+  "Frame_Shift_Del;Frame_Shift_Del;Frame_Shift_Del"  = "frameshift;frameshift;frameshift",
+  "Missense_Mutation;Missense_Mutation"             = "missense;missense",
+  "Missense_Mutation;Frame_Shift_Del"               = "missense;frameshift",
+  "Nonsense_Mutation;Missense_Mutation"             = "stop;missense"
+)
+
+# 2) apply it only to character columns
+data <- data %>%
+  mutate(across(
+    .cols = where(is.character),
+    .fns  = ~ str_replace_all(.x, mut_map)
+  ))
+```
+
+# Set Factors
+```{r}
+data$source <- factor(data$source, levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes"),
+                             labels = c("Cancer Positive (First Positive)", "Cancer Positive (Survivor)", "Cancer Negative (Survivor No)", "Cancer Negative (Survivor)"))
+
+data$cancer_status <- factor(data$cancer_status, levels = c("positive", "negative", ""),
+                                      labels = c("Positive", "Negative", "NA"))
+
+data$cancer_type <- factor(data$cancer_type, levels=c("ovarian", "breast", "lung", "mucinous", "neuroendocrine","peritoneal_papillary_serous_carcinoma", "prostate","liver", "endocrine", "thyroid", "thymoma", "myeloma", "cervical", "endometrial", ""), 
+                           labels=c("Ovarian", "Breast", "Lung", "Mucinous", "Neuroendocrine","Peritoneal Papillary Serous Carcinoma", "Prostate", "Liver", "Endocrine", "Thyroid", "Thymoma", "Myeloma", "Cervical", "Endometrial", "NA"))
+
+data$survivor <- factor(data$survivor, levels = c("yes", "no", ""),
+                                      labels = c("Yes", "No", "NA"))
+
+data <- data %>%
+  mutate(
+    sorting_value = case_when(
+      months_to_positive == "positive" ~ -1,
+      months_to_positive == "no_future_cancer" ~ 999,
+      months_to_positive == "UNK" ~ Inf,
+      months_to_positive == "pending" ~ Inf,
+      TRUE ~ as.numeric(months_to_positive)
+    )
+  ) %>%
+    arrange(
+    group_id, 
+    LIB_ID, 
+    cancer_status,
+    sorting_value,
+    cancer_type,
+    source,
+    desc(integrated_ctDNA_score),
+    desc(Tumour.Fraction), 
+    Mutation,
+    desc(consensus_griffin),
+    fragment_ratio_corr, 
+    FS, 
+    desc(avg_zscore_nuc_peaks)
+  )
+```
+
+```{r}
+outpath_path_2 <- paste0(outdir_data, "/04_figures_statistics_numerical_scores.csv")
+write.csv(data, outpath_path_2, row.names = FALSE)
+```
+
+```{r}
+outpath_path <- paste0(outdir_data, "/04_figures_statistics_data.csv")
+write.csv(data, outpath_path, row.names = FALSE)
+```
+
+```{r}
+nucleosome_peak_cutoff <- quantile(scores_normal$avg_zscore_nuc_peaks, 0.99, na.rm = TRUE)
+tumour_fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+fragment_ratio_cutoff <- quantile(scores_normal$fragment_ratio_corr , 0.01, na.rm = TRUE)
+fragment_length_cutoff <- quantile(scores_normal$FS , 0.99, na.rm = TRUE)
+consensus_griffin_cutoff <- quantile(scores_normal$consensus_griffin, 0.01, na.rm = TRUE)
+integrated_ctDNA_score_cutoff <- 0.5 
+```
+
+
+```{r}
+data_bar <- data
+``` 
+
+```{r}
+# Mark sample as "pos" if 5 or more z-scores are "pos", otherwise "neg"
+
+data$integrated_ctDNA_score <- ifelse(data$integrated_ctDNA_score >= integrated_ctDNA_score_cutoff, "pos", "neg")
+data$integrated_ctDNA_score[
+  is.na(data$`Library Name`) | data$`Library Name` == "" |
+  is.na(data$TS) | data$TS == "" |
+  data$months_to_positive %in% c("UNK", "pending")
+] <- "NS"
+
+data$consensus_griffin <- ifelse(data$consensus_griffin < consensus_griffin_cutoff, "pos", "neg")
+# Set consensus to "NS" for NA or empty Library Name
+data$consensus_griffin[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+data$fragment_ratio_corr <- ifelse(data$fragment_ratio_corr <= fragment_ratio_cutoff, "pos", "neg")
+data$fragment_ratio_corr[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+
+data$avg_zscore_nuc_peaks <- ifelse(data$avg_zscore_nuc_peaks >= nucleosome_peak_cutoff, "pos", "neg")
+data$avg_zscore_nuc_peaks[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+data$Tumour.Fraction <- ifelse(data$Tumour.Fraction >= tumour_fraction_cutoff, "pos", "neg")
+data$Tumour.Fraction[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+data$FS <- ifelse(data$FS >= fragment_length_cutoff, "pos", "neg")
+data$FS[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+data$`Library Name`[is.na(data$`Library Name`) | data$`Library Name` == ""] <- "NS"
+
+# Replace NA or empty strings in 'TS' with "NS" for the 'Mutation' column
+data$Mutation[is.na(data$TS) | data$TS == ""] <- "NS"
+data$TS[is.na(data$TS) | data$TS == ""] <- "NS"
+```
+
+
+```{r}
+data_mutation <- as.matrix(data[, c("Mutation", "Tumour.Fraction","FS", "consensus_griffin", "fragment_ratio_corr", "avg_zscore_nuc_peaks", "integrated_ctDNA_score")])
+
+colnames(data_mutation) <- c("Somatic Mutation", "CNA Tumour Fraction", "Fragment Length Score", "Consensus Griffin", "Fragment Ratio", "Nucleosome Peak Score", "Integrated Score")
+
+row.names(data_mutation) <- data$`group_id`
+data_mutation <- t(data_mutation)
+```
+
+```{r}
+# 1. Split data based on positive and negative samples
+# Filter for Cancer Positive
+# Define Cancer Positive and Cancer Negative groups
+positive_ids <- data$group_id[data$source %in% c("Cancer Positive (First Positive)", "Cancer Positive (Survivor)")]
+negative_ids <- data$group_id[data$source %in% c("Cancer Negative (Survivor No)", "Cancer Negative (Survivor)")]
+
+# Filter columns based on positive and negative groups
+data_positive <- data_mutation[, colnames(data_mutation) %in% positive_ids]
+data_negative <- data_mutation[, colnames(data_mutation) %in% negative_ids]
+
+# Adjust rows to calculate the percentage of "pos" values for each row in data_positive and data_negative
+
+data_positive[data_positive == "NS"] <- NA
+data_negative[data_negative == "NS"] <- NA
+
+# Convert specific values to 1, including "pos", "missense", "frameshift", and non-missing values
+data_positive <- ifelse(data_positive == "pos" | data_positive == "missense" | 
+                        data_positive == "frameshift", 1, 0)
+
+data_negative <- ifelse(data_negative == "pos" | data_negative == "missense" | 
+                        data_negative == "frameshift", 1, 0)
+
+# Calculate the percentage of "pos" values for each row in data_positive and data_negative
+percent_positive <- rowSums(data_positive == TRUE, na.rm = TRUE) / rowSums(!is.na(data_positive)) * 100
+percent_negative <- rowSums(data_negative == TRUE, na.rm = TRUE) / rowSums(!is.na(data_negative)) * 100
+
+# Round the percentages and add "%" for clarity
+percent_positive <- paste0(round(percent_positive, 1), "%")
+percent_negative <- paste0(round(percent_negative, 1), "%")
+
+# Optional: create dataframes to view the percentage results alongside the original data
+result_positive <- data.frame(data_positive, percent_positive)
+result_negative <- data.frame(data_negative, percent_negative)
+```
+
+# Set colours 
+```{r}
+## Set colours
+col <- c(missense = "#4DAF4A", frameshift = "black", stop = "#A65628",
+         splice_site = "#984EA3", deletion = "blue", duplication = "aquamarine2",
+         pos = "#fb9a99", NS = "grey65")
+
+col_type <- c(Ovarian = "#fd7f6f",  Breast = "#bd7ebe", Cervical = "#7eb0d5", Lung="#8bd3c7",  Prostate="#ebdc78", Liver="#fdcce5", "NA" = "white", Thyroid = "#ffb55a" , Thymoma="#4682b4", Myeloma="#9acd32", Endometrial = "blue")
+
+col_previous <- c(Positive = "#fb9a99", Negative = "grey95", "NA" = "grey95")
+
+col_survivor <- c(Yes = "#fb9a99", No = "grey95", NS = "grey65")
+```
+
+```{r}
+# Define the color function for numeric months
+col_months <- colorRamp2(
+  c(3, 6, 12, 24, 36),  # Breakpoints
+  c("black", "darkgrey", "grey", "lightgrey", "white")  # Gradient from black to white
+)
+
+
+col_months_with_categories <- function(x) {
+  if (is.na(x)) {  # If not sequenced
+    return("grey65")  # Assign a color for missing values
+  } else if (x == "no_future_cancer") {  # No cancer expected
+    return("green")
+  } else if (x == "UNK") {  # Unknown
+    return("yellow")
+  } else if (x == "positive") {  # Currently positive
+    return("black")
+  } else if (x == "pending") {  # Currently positive
+    return("blue")
+  } else {  # For numeric values, use the gradient
+    return(col_months(as.numeric(x)))
+  }
+}
+
+# Convert months_to_positive to a named vector for colors
+col_months_vector <- sapply(
+  data$months_to_positive,
+  col_months_with_categories
+)
+```
+
+```{r}
+## Set variables
+alter_fun = function(x, y, w, h, v) {
+  # full‐cell gray background
+  grid.rect(x, y, w, h, gp = gpar(fill = "grey95", col = NA))
+  n = sum(v)
+  if(n > 0) {
+    # split the full cell height evenly
+    total_h = h / n
+    for(i in seq_len(n)) {
+      y_i = y + (i - (n + 1)/2) * total_h
+      grid.rect(
+        x, y_i,
+        w, total_h,
+        gp = gpar(fill = col[names(which(v))][i], col = NA),
+        just = "center"
+      )
+    }
+  }
+}
+```
+
+```{r}
+cell_size_cm <- 0.7
+
+## Set additional annotations
+# Add `months_from_positive` to the top annotation
+bottom_annotation <- HeatmapAnnotation(
+  "Cancer Status" = data$cancer_status,
+  "Cancer History" = data$survivor,
+  "Cancer Type" = data$cancer_type,
+  "Months to Positive" = anno_simple(
+    data$months_to_positive,
+    col = col_months_vector  # Provide the pre-mapped colors
+  ),
+  #height = unit(2, "inches"),  # Adjust this value to increase the vertical space
+  border = FALSE,
+  annotation_name_side = "left",
+  show_annotation_name = TRUE,
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = left_label_fontsize),
+  col = list(
+    "Cancer Status" = col_previous,
+    "Cancer History" = col_survivor,
+    "Cancer Type" = col_type
+  ),
+  show_legend = TRUE,
+  simple_anno_size = unit(cell_h_cm, "cm")
+)
+
+```
+
+### Calculate Alteration Percents - may need to remove 
+```{r}
+
+# Calculate the row sums for positive and negative data, ignoring NAs
+positive_counts <- rowSums(data_positive, na.rm = TRUE)  # Sum across rows for positive samples
+negative_counts <- rowSums(data_negative, na.rm = TRUE)  # Sum across rows for negative samples
+
+right_annotation <- rowAnnotation(
+  Positive_Percent = anno_text(
+    percent_positive,
+    gp = gpar(fontsize = right_text_fontsize)
+  ),
+  Positive_Barplot = anno_barplot(
+    positive_counts,
+    border     = FALSE,
+    width      = unit(right_bar_width_cm, "cm"),
+    gp         = gpar(fill = "#fb9a99", col = NA),
+    axis_param = list(
+      side      = "top",
+      labels_rot= 90,
+      gp        = gpar(fontsize = right_axis_fontsize)
+    )
+  ),
+  Negative_Percent = anno_text(
+    percent_negative,
+    gp = gpar(fontsize = right_text_fontsize)
+  ),
+  Negative_Barplot = anno_barplot(
+    negative_counts,
+    border     = FALSE,
+    width      = unit(right_bar_width_cm, "cm"),
+    gp         = gpar(fill = "#fb9a99", col = NA),
+    axis_param = list(
+      side      = "top",
+      labels_rot= 90,
+      gp        = gpar(fontsize = right_axis_fontsize)
+    )
+  ),
+  gap = right_gap,
+  show_annotation_name = FALSE
+)
+```
+
+
+```{r}
+## Set legend labels
+# Define the legend for months_from_positive
+legend_months <- Legend(
+  title = "Months to Positive",
+  at = c("<3 months", "3 - 6 months", "6-12 months", "12-24 months", "24-36 months", 
+         "no future cancer", "unknown", "positive"),
+  legend_gp = gpar(fill = c("black", "darkgrey", "grey", "lightgrey", "white", 
+                            "green", "yellow", "black")),  # Positive is also white
+  title_gp = gpar(fontsize = 30),
+  labels_gp = gpar(fontsize = 25),
+  grid_height = unit(3, "mm"),
+  nrow = 5, 
+  border = TRUE
+)
+
+# Add this to the existing annotation legends
+annotation_legend <- packLegend(
+  list = list(
+    Legend(title = "Cancer Type",
+           at = c("Ovarian", "Cervical", "Breast", "Lung",
+                   "Prostate", "Liver", "NA", 
+                  "Thyroid", "Thymoma", "Myeloma", "Endometrial"),
+           legend_gp = gpar(fill = c("#fd7f6f","#7eb0d5","#bd7ebe","#8bd3c7",
+                                     "#ebdc78", "#fdcce5", "white",
+                                      "#ffb55a" ,"#4682b4","#9acd32", "blue")),
+           title_gp = gpar(fontsize = 30),     # <- larger title
+           labels_gp = gpar(fontsize = 25),    # <- larger labels
+           grid_height = unit(4, "mm"),        # <- larger colored boxes
+           nrow = 4),
+    Legend(title = "Alterations",
+           at = c("missense", "frameshift", "stop","splice_site", "deletion", "duplication"),
+           legend_gp = gpar(fill = c("#4DAF4A","black","#A65628", "#984EA3","blue","aquamarine2")),
+           title_gp = gpar(fontsize = 30),
+           labels_gp = gpar(fontsize = 25),
+           grid_height = unit(4, "mm"),
+           nrow = 4),
+    Legend(title = "Detection",
+           at = c("Positive", "Negative", "Not Sequenced"),
+           legend_gp = gpar(fill = c("#fb9a99", "grey95", "grey65")),
+           title_gp = gpar(fontsize = 30),
+           labels_gp = gpar(fontsize = 25),
+           grid_height = unit(3, "mm"),
+           nrow = 3),
+    legend_months  # Add the months_from_positive legend
+  ),
+  max_height = unit(6, "inches"),
+  direction = "horizontal"
+)
+
+```
+
+```{r}
+
+top_annotation <- HeatmapAnnotation(
+  "CNA Tumour\nFraction" = anno_barplot(
+    ifelse(is.na(data_bar$Tumour.Fraction), 0, data_bar$Tumour.Fraction),
+    gp = gpar(
+      fill = ifelse(data_bar$Tumour.Fraction >= tumour_fraction_cutoff, "red", "black"),  # Red if > 0.1, default otherwise
+      col = ifelse(data_bar$Tumour.Fraction >= tumour_fraction_cutoff, "red", "black")   # Border color matches fill
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ),
+  "Fragment Length\nScore" = anno_barplot(
+    ifelse(is.na(data_bar$FS), 0, data_bar$FS),
+    gp = gpar(
+      fill = ifelse(data_bar$FS >= fragment_length_cutoff, "red", "black"),
+      col = ifelse(data_bar$FS >= fragment_length_cutoff, "red", "black")
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ),
+  "Consensus Griffin" = anno_barplot(
+    ifelse(is.na(data_bar$consensus_griffin), 0, data_bar$consensus_griffin),
+    gp = gpar(
+      fill = ifelse(data_bar$consensus_griffin < consensus_griffin_cutoff , "red", "black"),
+      col = ifelse(data_bar$consensus_griffin < consensus_griffin_cutoff,"red", "black" )
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ),
+  "Fragment Ratio\nScore" = anno_barplot(
+    ifelse(is.na(data_bar$fragment_ratio_corr), 0, data_bar$fragment_ratio_corr),
+    gp = gpar(
+      fill = ifelse(data_bar$fragment_ratio_corr <= fragment_ratio_cutoff, "red", "black"),
+      col = ifelse(data_bar$fragment_ratio_corr <= fragment_ratio_cutoff, "red", "black")
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ),
+  "Nucleosome Peak\nScore" = anno_barplot(
+    ifelse(is.na(data_bar$avg_zscore_nuc_peaks), 0, data_bar$avg_zscore_nuc_peaks),
+    gp = gpar(
+      fill = ifelse(data_bar$avg_zscore_nuc_peaks >= nucleosome_peak_cutoff, "red", "black"),
+      col = ifelse(data_bar$avg_zscore_nuc_peaks >= nucleosome_peak_cutoff, "red", "black")
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ), 
+  "Integratated\nctDNA Score" = anno_barplot(
+    ifelse(is.na(data_bar$integrated_ctDNA_score), 0, data_bar$integrated_ctDNA_score),
+    gp = gpar(
+      fill = ifelse(data_bar$integrated_ctDNA_score > integrated_ctDNA_score_cutoff, "red", "black"),
+      col = ifelse(data_bar$integrated_ctDNA_score > integrated_ctDNA_score_cutoff, "red", "black")
+    ),
+    bar_width = unit(cell_w_cm, "cm"),
+    axis_param = list(gp = gpar(fontsize = top_axis_fontsize)),
+    border = FALSE
+  ),
+  annotation_name_side = "left",
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = left_label_fontsize),
+  height = unit(5, "inches"),
+  gap = unit(3.4, "mm")
+)
+```
+
+
+```{r}
+row_order <- row.names(data_mutation)
+col_order <- colnames(data_mutation)
+
+col_split <- data$LIB_ID
+
+stopifnot(length(col_order) == length(col_split))
+```
+
+
+
+```{r}
+## Generate heatmap
+pdf(file.path(outdir, "04_figure_statistics_integrated_barplot_by_LIB_ID_to_publish.pdf"), width = 29, height =14)
+oncoPrint <- oncoPrint(
+  data_mutation,
+  # row_split = rownames(data_mutation), 
+  alter_fun         = alter_fun,
+  col               = col,
+  column_split      = col_split,
+  column_gap          = unit(0.2, "cm"),
+  # hide the split‐group labels:
+  column_title      = NULL,
+  column_title_gp   = gpar(fontsize = 0),
+  show_column_names   = TRUE, 
+  column_names_side = "top",
+  show_heatmap_legend = FALSE,
+  show_pct            = FALSE,
+  bottom_annotation   = top_annotation,
+  top_annotation      = bottom_annotation,
+  # right_annotation    = right_annotation,
+  right_annotation    = NULL,
+  
+  show_row_names      = TRUE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = left_label_fontsize),
+  row_title = NULL,
+  
+  row_order           = row_order,
+  row_gap             = unit(row_gap_cm, "cm"),
+
+  height              = unit(cell_h_cm * nrow(data_mutation), "cm"),
+  width               = unit(cell_w_cm * ncol(data_mutation), "cm"),
+  
+  border_gp = gpar(col = "grey80", lwd = 0.4),  # light grey, very thin
+)
+
+# draw(oncoPrint, show_annotation_legend = TRUE, heatmap_legend_side = "bottom")
+draw(oncoPrint, heatmap_legend_list = annotation_legend, show_annotation_legend = FALSE, heatmap_legend_side = "bottom")
+
+decorate_annotation("CNA Tumour\nFraction", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(tumour_fraction_cutoff, tumour_fraction_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+
+decorate_annotation("Fragment Length\nScore", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(fragment_length_cutoff, fragment_length_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+
+decorate_annotation("Fragment Ratio\nScore", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(fragment_ratio_cutoff , fragment_ratio_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+# Add a red dashed line to the "Ovarian Griffin Z-Score" annotation
+decorate_annotation("Consensus Griffin", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(consensus_griffin_cutoff, consensus_griffin_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+
+decorate_annotation("Nucleosome Peak\nScore", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(nucleosome_peak_cutoff, nucleosome_peak_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+decorate_annotation("Integratated\nctDNA Score", {
+  grid.lines(
+    c(0.5, 194.5),  # x-coordinates: from the left edge to the right edge
+    c(integrated_ctDNA_score_cutoff, integrated_ctDNA_score_cutoff),  # y-coordinate for the line
+    gp = gpar(lty = 2, col = "red", lwd = 2.2),  # Dashed red line
+    default.units = "native"
+  )
+})
+dev.off()
+```

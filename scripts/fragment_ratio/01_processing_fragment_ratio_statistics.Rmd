@@ -1,0 +1,215 @@
+
+```{r}
+library(dplyr)
+library(matrixStats)
+#library(psych)
+library(ComplexHeatmap)
+library(readxl)
+library(here)
+library(reshape2)
+
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+date <- Sys.Date();
+```
+
+
+```{r}
+### Set variables
+outdir <- here::here("data", "fragment_ratio")
+
+# File paths
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+data_ratio_path <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_per5Mb_fragment_ratios.csv")
+data_normal_path <- here::here("data", "HBOC_pipeline_output", "control", "control_per5Mb_fragment_ratios.csv")
+
+# Output file
+file_name <- paste0("01_processing_fragment_ratio_differential.txt")
+out_file_path <- file.path(outdir, file_name)
+
+# Import samples and data
+samples <- read_excel(samples_path, sheet = "April22")
+data_ratio <- read.csv(data_ratio_path, header = TRUE, check.names = FALSE)
+data_normal <- read.csv(data_normal_path, header = TRUE, check.names = FALSE)
+
+# remove failed samples 
+samples <- samples[!grepl("CHARMQ_0788_Pl_T_PG_T-788", samples$`Library Name`), ]
+samples <- samples[!grepl("CHARMQ_0207_Pl_T_PG_T-207", samples$`Library Name`), ]
+
+data_ratio <- data_ratio[, !colnames(data_ratio) %in% c("CHARMQ_0788_Pl_T_PG_T-788", "CHARMQ_0207_Pl_T_PG_T-207")]
+``` 
+
+```{r}
+# Remove noise location
+# data_ratio <- data_ratio[!(data_ratio$seqnames == "chr6" & data_ratio$start == "30100000"),]
+# data_normal <- data_normal[!(data_normal$seqnames == "chr6" & data_normal$start == "30100000"),]
+
+# Format columns
+colnames(samples)[colnames(samples) == "Library Name"] <- "sWGS"
+samples <- samples[samples$sWGS %in% colnames(data_ratio), ]
+
+# Extract chromosomes
+data_chr <- data_ratio[, c("seqnames", "arm", "start", "end")]
+data_chr$name <- with(data_chr, paste0(seqnames, "_", start))
+
+# Calculate healthy median and SD
+row.names(data_normal) <- with(data_normal, paste0(seqnames, "_", start))
+data_normal <- as.matrix(data_normal[, -c(1:5)])
+normal_median <- rowMedians(data_normal, na.rm = TRUE)
+normal_sd <- rowSds(data_normal, na.rm = TRUE)
+
+# Format ratio sheet and order samples properly
+row.names(data_ratio) <- with(data_ratio, paste0(seqnames, "_", start))
+data_ratio <- data_ratio[, samples$sWGS]
+
+# Prepare metadata for merging
+samples_de <- as.data.frame(cbind(samples[, c("sWGS", "cancer_status")], "HBOC"))
+colnames(samples_de) <- c("sWGS", "cancer_status", "diag")
+normal_de <- as.data.frame(cbind(colnames(data_normal), "HBC", "HBC"))
+colnames(normal_de) <- c("sWGS", "cancer_status", "diag")
+samples_de <- bind_rows(samples_de, normal_de)
+
+# Merge data and metadata
+data_de <- bind_cols(data_ratio, data_normal)
+data_de <- as.data.frame(t(data_de))
+data_de <- merge(data_de, samples_de, by.x = "row.names", by.y = "sWGS")
+data_de_melt <- reshape2::melt(data_de, id = c("Row.names", "diag", "cancer_status"))
+
+# Calculate t-tests for positive samples
+t_test_positive <- c()
+vars <- unique(data_de_melt$variable)
+for (var in vars) {
+  a <- t.test(data_de_melt$value[data_de_melt$diag == "HBC" & data_de_melt$variable == var],
+              data_de_melt$value[data_de_melt$cancer_status == "positive" & data_de_melt$variable == var])$p.value
+  t_test_positive <- c(t_test_positive, a)
+}
+
+# Calculate t-tests for negative samples
+t_test_negative <- c()
+for (var in vars) {
+  a <- t.test(data_de_melt$value[data_de_melt$diag == "HBC" & data_de_melt$variable == var],
+              data_de_melt$value[data_de_melt$cancer_status == "negative" & data_de_melt$variable == var])$p.value
+  t_test_negative <- c(t_test_negative, a)
+}
+
+# Combine t-test results into a data frame
+t_test_positive <- as.data.frame(cbind(as.character(vars), t_test_positive))
+t_test_negative <- as.data.frame(cbind(as.character(vars), t_test_negative))
+
+# Calculate fold changes
+fold_change_positive <- rowMedians(as.matrix(data_ratio[, samples$sWGS[samples$cancer_status == "positive"]]), na.rm = TRUE) / normal_median
+fold_change_negative <- rowMedians(as.matrix(data_ratio[, samples$sWGS[samples$cancer_status == "negative"]]), na.rm = TRUE) / normal_median
+
+# Calculate z-scores
+data_change_positive <- (data_ratio[, samples$sWGS[samples$cancer_status == "positive"]] - normal_median) / normal_sd
+data_change_negative <- (data_ratio[, samples$sWGS[samples$cancer_status == "negative"]] - normal_median) / normal_sd
+
+z_score_positive <- rowMedians(as.matrix(data_change_positive), na.rm = TRUE)
+z_score_negative <- rowMedians(as.matrix(data_change_negative), na.rm = TRUE)
+
+```
+
+```{r}
+# Merge results into the differential table
+de_table <- data.frame(
+  location = vars,
+  chr = gsub("_.*", "", vars),
+  t_test_negative = as.numeric(t_test_negative$t_test_negative), # padj
+  z_score_negative = as.numeric(z_score_negative), # Already numeric but ensure compatibility
+  healthy_median = as.numeric(normal_median),
+  healthy_sd = as.numeric(normal_sd),
+  t_test_positive = as.numeric(t_test_positive$t_test_positive), # padj
+  z_score_positive = as.numeric(z_score_positive),
+  fold_change_positive = as.numeric(fold_change_positive),
+  fold_change_negative = as.numeric(fold_change_negative)
+)
+```
+
+
+```{r}
+# Define thresholds for classification
+increase_threshold <- 1
+decrease_threshold <- 1
+p_value_threshold <- 0.05
+
+# Classify bins based on fold change and t-test results
+de_table$class_positive <- ifelse(
+  de_table$fold_change_positive > increase_threshold & de_table$t_test_positive < p_value_threshold, "Increased",
+  ifelse(de_table$fold_change_positive < decrease_threshold & de_table$t_test_positive < p_value_threshold, "Decreased", "Stable")
+)
+
+de_table$class_negative <- ifelse(
+  de_table$fold_change_negative > increase_threshold & de_table$t_test_negative < p_value_threshold, "Increased",
+  ifelse(de_table$fold_change_negative < decrease_threshold & de_table$t_test_negative < p_value_threshold, "Decreased", "Stable")
+)
+```
+
+```{r}
+# Write table to file
+write.table(de_table, out_file_path, sep = "\t", row.names = FALSE)
+```
+
+```{r}
+# Count the total number of "Increased" and "Decreased"
+total_increased <- sum(de_table$class_positive == "Increased", na.rm = TRUE)
+total_decreased <- sum(de_table$class_positive == "Decreased", na.rm = TRUE)
+
+# Calculate median fold change for "Increased" and "Decreased"
+median_increased <- median(de_table$fold_change_positive[de_table$class_positive == "Increased"], na.rm = TRUE)
+median_decreased <- median(de_table$fold_change_positive[de_table$class_positive == "Decreased"], na.rm = TRUE)
+
+# Print the total counts and median fold changes
+cat("Total Increased bins (Positive):", total_increased, "\n")
+cat("Total Decreased bins (Positive):", total_decreased, "\n")
+cat("Median Fold Change (Increased, Positive):", median_increased, "\n")
+cat("Median Fold Change (Decreased, Positive):", median_decreased, "\n")
+
+# Group by 'chr' and calculate median fold change for each chromosome
+chr_counts <- de_table %>%
+  dplyr::group_by(chr) %>%
+  dplyr::summarize(
+    Total = dplyr::n(),
+    Increased = base::sum(class_positive == "Increased", na.rm = TRUE),
+    Decreased = base::sum(class_positive == "Decreased", na.rm = TRUE),
+    Median_Fold_Change_Increased = stats::median(fold_change_positive[class_positive == "Increased"], na.rm = TRUE),
+    Median_Fold_Change_Decreased = stats::median(fold_change_positive[class_positive == "Decreased"], na.rm = TRUE)
+  )
+
+# Print chromosome-specific counts
+cat("Chromosome-specific counts and median fold changes (Positive):\n")
+print(chr_counts)
+```
+
+```{r}
+# Count the total number of "Increased" and "Decreased" for class_negative
+total_increased_negative <- sum(de_table$class_negative == "Increased", na.rm = TRUE)
+total_decreased_negative <- sum(de_table$class_negative == "Decreased", na.rm = TRUE)
+
+# Calculate median fold change for "Increased" and "Decreased" (class_negative)
+median_increased_negative <- median(de_table$fold_change_negative[de_table$class_negative == "Increased"], na.rm = TRUE)
+median_decreased_negative <- median(de_table$fold_change_negative[de_table$class_negative == "Decreased"], na.rm = TRUE)
+
+# Print the total counts and median fold changes for class_negative
+cat("Total Increased bins (Negative):", total_increased_negative, "\n")
+cat("Total Decreased bins (Negative):", total_decreased_negative, "\n")
+cat("Median Fold Change (Increased, Negative):", median_increased_negative, "\n")
+cat("Median Fold Change (Decreased, Negative):", median_decreased_negative, "\n")
+
+# Group by 'chr' and calculate median fold change for each chromosome
+chr_counts_negative <- de_table %>%
+  dplyr::group_by(chr) %>%
+  dplyr::summarize(
+    Total = dplyr::n(),
+    Increased = base::sum(class_negative == "Increased", na.rm = TRUE),
+    Decreased = base::sum(class_negative == "Decreased", na.rm = TRUE),
+    Median_Fold_Change_Increased = stats::median(fold_change_negative[class_negative == "Increased"], na.rm = TRUE),
+    Median_Fold_Change_Decreased = stats::median(fold_change_negative[class_negative == "Decreased"], na.rm = TRUE)
+  )
+
+# Print chromosome-specific counts for class_negative
+cat("Chromosome-specific counts and median fold changes (Negative):\n")
+print(chr_counts_negative)
+```

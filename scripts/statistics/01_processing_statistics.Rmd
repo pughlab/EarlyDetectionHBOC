@@ -1,0 +1,216 @@
+---
+title: "01_processing_statistics"
+output: html_document
+date: "`r Sys.Date()`"
+params: 
+  ichorCNA_estimate_table: "HBOC_ichorCNA_estimates.tsv"
+  HBC_ichorCNA_estimate_table: "HBC_ichorCNA_estimates.tsv"
+---
+
+```{r}
+# import cohort data 
+library(readxl)
+library(dplyr)
+```
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+```{r}
+outdir <- here::here("data", "statistics")
+date <- Sys.Date();
+
+
+# samples 
+samples_path <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+samples <- read_excel(samples_path, sheet = "April22")
+samples <- samples[!grepl("-B|-Tumour", samples$group_id), ]
+samples <- samples[!(is.na(samples$TS) & is.na(samples$`Library Name`)), ]
+samples <- samples[,c("group_id", "LIB_ID", "Library Name", "TS", "cancer_status")]
+
+# mutation path 
+oncoplot_path <- here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx")
+oncoplot <- read_excel(oncoplot_path)
+oncoplot <- oncoplot[,c("group_id", "Library Name", "TS", "BRCA1_somatic", "BRCA2_somatic", "TP53", "PMS2", "PALB2", "EPCAM", "MLH1", "MSH2", "MSH6", "ATM", "ATR")]
+oncoplot <- oncoplot[!(is.na(oncoplot$TS) & is.na(oncoplot$`Library Name`)), ]
+
+
+# ichorCNA path 
+ichorCNA_data_path <- here::here("raw_data", "ichorCNA", params$ichorCNA_estimate_table)
+ichorCNA <- read.delim(ichorCNA_data_path, header = TRUE)
+ichorCNA <- ichorCNA[, c("ID","Tumour.Fraction")]
+
+fragment_ratio_correlation_path <- here::here("data", "fragment_ratio", "02_fragment_ratio_genome_healthy_correlation.txt")
+fragment_ratio_corr <- read.delim(fragment_ratio_correlation_path, header = TRUE)
+colnames(fragment_ratio_corr)[colnames(fragment_ratio_corr) == "correlation"] <- "fragment_ratio_corr"
+
+
+griffin_scores_all <- here::here("data", "griffin", "05_processing_griffin_nucleosome_accesibility_all_cancer_scores.csv")
+griffin_scores_all <- read.csv(griffin_scores_all, header=TRUE)
+
+nucleosome_peak_score <- here::here("data", "nucleosome_peaks", "02_processing_nucleosome_peaks_cancer_scores.csv")
+nucleosome_peak_score <- read.csv(nucleosome_peak_score, header = TRUE)
+
+
+FS_data <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_FS_score.csv")
+FS_data <- read.csv(FS_data, check.names = FALSE)
+FS_data <- FS_data[FS_data$Sample %in% samples$'Library Name',]
+
+methylation_scores <- here::here("raw_data", "cfMeDIP", "methy_scores_0528.tsv")
+methylation_scores <- read.delim(methylation_scores, check.names = FALSE, header= TRUE, sep = "\t")
+methylation_scores <- methylation_scores %>% dplyr::select(group_id, cfMeDIP, HBOC_breast, HBOC_ovarian)
+```
+
+# Import Healthy Control Samples. 
+```{r}
+normal_griffin_all <- here::here("data", "griffin", "05_processing_griffin_nucleosome_accesibility_all_normal_scores.csv")
+normal_griffin_all <- read.csv(normal_griffin_all, header=TRUE, check.names=FALSE)
+
+
+FS_score_healthy <- here::here("data",  "HBOC_pipeline_output", "control", "control_FS_score.csv")
+FS_score_healthy <- read.csv(FS_score_healthy, header=TRUE, check.names=FALSE)
+
+nucleosome_peak_healthy <- here::here("data", "nucleosome_peaks", "02_processing_nucleosome_peaks_control_scores.csv")
+nucleosome_peak_healthy  <- read.csv(nucleosome_peak_healthy, header=TRUE, check.names=FALSE)
+
+fragment_ratio_corr_healthy_path <- here::here("data", "fragment_ratio", "02_fragment_ratio_genome_healthy_correlation.txt")
+fragment_ratio_corr_healthy <- read.delim(fragment_ratio_corr_healthy_path, header = TRUE, check.names=FALSE)
+colnames(fragment_ratio_corr_healthy )[colnames(fragment_ratio_corr_healthy) == "correlation"] <- "fragment_ratio_corr"
+
+ichorCNA_normal_path <- here::here("raw_data", "ichorCNA", params$HBC_ichorCNA_estimate_table)
+ichorCNA_normal <- read.delim(ichorCNA_normal_path, header=TRUE)
+ichorCNA_normal <- ichorCNA_normal[, c("ID","Tumour.Fraction")]
+```
+
+# Process Normal Sample Scores 
+```{r}
+# Rename 'Patient' to 'Sample' in normal_griffin_breast and normal_griffin_ovarian
+colnames(normal_griffin_all)[colnames(normal_griffin_all) == "Patient"] <- "Sample"
+# Drop unnecessary columns before merging
+normal_griffin_all <- normal_griffin_all[, !grepl("^MeanDifference", colnames(normal_griffin_all))]
+
+# Get the raw z-score columns
+zscore_cols_normal <- grep("^AverageZScore_", colnames(normal_griffin_all), value = TRUE)
+
+# Create cumulative z-score column by summing raw z-scores row-wise
+normal_griffin_all$consensus_griffin <- rowSums(normal_griffin_all[, zscore_cols_normal], na.rm = TRUE)
+
+normal_griffin_all <- normal_griffin_all[, !(colnames(normal_griffin_all) %in% zscore_cols_normal)]
+```
+
+```{r}
+# Merge with FS_score_healthy
+merged_with_FS <- merge(normal_griffin_all, FS_score_healthy, by="Sample", all=TRUE)
+
+# Merge with nucleosome_peak_healthy
+final_merged_df <- merge(merged_with_FS, nucleosome_peak_healthy, by="Sample", all=TRUE)
+```
+
+```{r}
+colnames(fragment_ratio_corr_healthy)[colnames(fragment_ratio_corr_healthy) == "sample"] <- "Sample"  # Standardize naming
+
+# **Filter fragment_ratio_corr to include only samples present in final_merged_df**
+fragment_ratio_corr_healthy <- fragment_ratio_corr_healthy[fragment_ratio_corr_healthy$Sample %in% final_merged_df$Sample, ]
+
+# Merge the filtered fragment_ratio_corr with final_merged_df
+control_scores_merged <- merge(final_merged_df, fragment_ratio_corr_healthy, by="Sample", all=TRUE)
+
+control_scores_merged_V2 <- merge(control_scores_merged, ichorCNA_normal, by.x = "Sample", by.y = "ID", all = TRUE)
+```
+
+
+```{r}
+# List of columns to check for mutations
+mutation_columns <- c("TP53", "PMS2", "PALB2", "EPCAM", "MLH1", "MSH2", "MSH6", "ATM", "ATR", "BRCA1_somatic", "BRCA2_somatic")
+
+mutation_df <- oncoplot 
+# Create the Mutation column based on whether any of the columns have a value
+
+mutation_df$Mutation <- apply(mutation_df[, mutation_columns], 1, function(row) {
+  # Filter out NA and empty values
+  valid_values <- row[!is.na(row) & row != ""]
+  
+  # If there are valid values, return them concatenated by ';', otherwise return an empty string
+  if (length(valid_values) > 0) {
+    return(paste(valid_values, collapse = ";"))
+  } else {
+    return("")
+  }
+})
+
+mutation_df <- mutation_df[, c("group_id", "Library Name", "TS", "Mutation")]
+```
+
+```{r}
+merged_df <- merge(mutation_df, ichorCNA, by.x = "Library Name", by.y = "ID", all = TRUE)
+```
+
+```{r}
+final_df <- merge(merged_df, samples[, !(names(samples) %in% c("TS", "Library Name"))], 
+                  by = "group_id", all = TRUE)
+```
+
+```{r}
+# merge fragment length score (Vessie et al)
+final_df <- merge(final_df, FS_data, by.x = "Library Name", by.y = "Sample", all = TRUE)
+
+```
+
+# Process griffin scores to combine to one column 
+```{r}
+griffin_scores_all <- griffin_scores_all[, !grepl("^MeanDifference", colnames(griffin_scores_all))]
+
+# Get the raw z-score columns
+zscore_cols <- grep("^AverageZScore_", colnames(griffin_scores_all), value = TRUE)
+
+# Create cumulative z-score column by summing raw z-scores row-wise
+griffin_scores_all$consensus_griffin <- rowSums(griffin_scores_all[, zscore_cols], na.rm = TRUE)
+
+griffin_scores_all <- griffin_scores_all[, !(colnames(griffin_scores_all) %in% zscore_cols)]
+```
+
+```{r}
+
+# merge nucleosome accesibility 
+final_df <- merge(final_df, griffin_scores_all, by.x = "Library Name", by.y = "Patient", all = TRUE)
+```
+
+
+```{r}
+# merge nucleosome peaks 
+final_df <- merge(final_df, nucleosome_peak_score, by.x = "Library Name", by.y = "Sample", all = TRUE)
+
+# merge fragment_ratio data 
+final_df <- merge(final_df, fragment_ratio_corr, 
+                  by.x = "Library Name", by.y = "sample", all.x = TRUE)
+```
+
+```{r}
+# add methylation score 
+final_df_w_methy_score <- merge(final_df, methylation_scores, by= "group_id", all = TRUE)
+final_df_w_methy_score <- final_df_w_methy_score %>% dplyr::select(group_id, `Library Name`, TS, cfMeDIP,  everything())
+
+final_df_w_methy_score$cancer_status[final_df_w_methy_score$group_id == "LIB-04-0131-T0"] <- "negative"
+final_df_w_methy_score$cancer_status[final_df_w_methy_score$group_id == "LIB-04-0441-T1"] <- "negative"
+final_df_w_methy_score$cancer_status[final_df_w_methy_score$group_id == "LIB-04-0024-T2"] <- "positive"
+final_df_w_methy_score$cancer_status[final_df_w_methy_score$group_id == "LIB-04-0649-T0"] <- "positive"
+# remove 2 CHARMQ samples
+final_df_w_methy_score <- final_df_w_methy_score[!grepl("T-788-T0", final_df_w_methy_score$group_id), ]
+final_df_w_methy_score <- final_df_w_methy_score[!grepl("T-207-T0", final_df_w_methy_score$group_id), ]
+
+# if it contains not_sequenced then remove... 
+final_df_w_methy_score$Mutation <- ifelse(grepl("not_sequenced", final_df_w_methy_score$Mutation), "", final_df_w_methy_score$Mutation)
+```
+
+```{r}
+write.csv(control_scores_merged_V2, file = paste0(outdir,  "/01_statistics_control_scores.csv"), row.names = FALSE)
+```
+
+```{r}
+
+write.csv(final_df_w_methy_score, file = paste0(outdir,  "/01_statistics_HBOC_scores.csv"), row.names = FALSE)
+```
+

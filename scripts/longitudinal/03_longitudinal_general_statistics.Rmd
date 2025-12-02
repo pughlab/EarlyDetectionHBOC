@@ -1,0 +1,52 @@
+---
+title: "03_longitudinal_statistics"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+# set the working directory
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+# read in data 
+long_data_path <- here::here("data", "longitudinal", "01_processing_longitudinal_samples.csv")
+long_data <- read.csv(long_data_path, header=TRUE, check.names=FALSE)
+```
+
+```{r}
+# Filter to only Blood Draw events
+blood_draws <- long_data[long_data$Event_Type == "Blood Draw", ]
+
+# --- Cohort-level summary --- 
+cohort_stats <- list(
+  total_patients = length(unique(blood_draws$Patient_ID)),
+  total_samples = nrow(blood_draws),
+  months_min = min(blood_draws$months_from_baseline, na.rm = TRUE),
+  months_max = max(blood_draws$months_from_baseline, na.rm = TRUE),
+  months_median = median(blood_draws$months_from_baseline, na.rm = TRUE),
+  months_mean = mean(blood_draws$months_from_baseline, na.rm = TRUE),
+  months_sd = sd(blood_draws$months_from_baseline, na.rm = TRUE)
+)
+
+print("Cohort-level stats:")
+print(cohort_stats)
+
+# --- Per-patient summary ---
+library(dplyr)
+
+patient_stats <- blood_draws %>%
+  dplyr::group_by(Patient_ID) %>%
+  dplyr::summarise(
+    n_timepoints = n(),
+    months_min = min(months_from_baseline, na.rm = TRUE),
+    months_max = max(months_from_baseline, na.rm = TRUE),
+    months_range = months_max - months_min
+  ) %>%
+  dplyr::arrange(desc(n_timepoints))
+
+print("Per-patient stats:")
+print(patient_stats)
+
+```

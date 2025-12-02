@@ -1,0 +1,657 @@
+---
+title: "02_figure_fragment_ratio_heatmap_to_publish"
+output: html_document
+date: "`r Sys.Date()`"
+params: 
+  ichorCNA_estimate_table: "HBOC_ichorCNA_estimates.tsv"
+  HBC_ichorCNA_estimate_table: "HBC_ichorCNA_estimates.tsv"
+---
+
+```{r}
+library(dplyr)
+library(matrixStats)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(gridExtra)
+library(readxl)
+library(data.table)
+library(psych)
+library(here)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+date <- Sys.Date();
+```
+
+### Set variables
+```{r}
+# Data and figure output directories
+data_path_out <- here::here("data","fragment_ratio")
+outdir <- here::here("figures","fragment_ratio")
+data_path_out_stats <- here::here("data","Statistics")
+```
+
+```{r}
+# ────────────────────────────────────────────
+#  master font‐size variables
+# ────────────────────────────────────────────
+fs_row_names     <- 10  # heatmap row names
+fs_ann_titles    <- 8  # annotation strip titles ("Tumour\nFraction", etc)
+fs_ann_axis      <- 8  # the tick‐label text on anno_barplot/anno_lines
+fs_legend_title  <- 12  # legend titles
+fs_legend_labels <- 11 # legend item labels
+# ────────────────────────────────────────────
+```
+
+```{r}
+# Set file paths
+fragment_ratio_differential <- here::here("data", "fragment_ratio", "01_processing_fragment_ratio_differential.txt")
+samples <- here::here("raw_data", "cohort", "HBOC_cohort_metadata.xlsx")
+
+# Healthy fragment ratio data
+data_healthy <- here::here("data", "HBOC_pipeline_output", "control", "control_per5Mb_fragment_ratios.csv")
+data_ratio <- here::here("data", "HBOC_pipeline_output", "HBOC", "HBOC_per5Mb_fragment_ratios.csv")
+
+scores_path <- here::here("raw_data", "ichorCNA", params$ichorCNA_estimate_table)
+scores <- read.delim(scores_path, sep = "\t")[, c("ID", "Tumour.Fraction")]
+
+scores_normal_path <- here::here("raw_data", "ichorCNA", params$HBC_ichorCNA_estimate_table)
+scores_normal <- read.delim(scores_normal_path, sep = "\t")[, c("ID", "Tumour.Fraction")]
+
+tumour_fraction_cutoff <- quantile(scores_normal$Tumour.Fraction , 0.99, na.rm = TRUE)
+
+mutations <- read_excel(here::here("raw_data", "mutations", "HBOC_oncoplot_Oct2.xlsx"))
+mutations <- mutations[, c("Library Name", "BRCA1_somatic", "BRCA2_somatic", "vaf_BRCA1_somatic", "vaf_BRCA2_somatic", "TP53", "vaf_TP53", "PALB2", "vaf_PALB2")]
+```
+
+```{r}
+colnames(mutations)[colnames(mutations) == "Library Name"] <- "sample"
+
+# Create a new column 'vaf' that combines the two columns
+mutations$vaf <- ifelse(
+  !is.na(mutations$vaf_BRCA1_somatic), mutations$vaf_BRCA1_somatic,
+  ifelse(
+    !is.na(mutations$vaf_BRCA2_somatic), mutations$vaf_BRCA2_somatic,
+    ifelse(
+      !is.na(mutations$vaf_TP53), mutations$vaf_TP53,
+      mutations$vaf_PALB2
+    )
+  )
+)
+
+mutations <- mutations[!is.na(mutations$"sample"), ]
+
+# Create a named vector for mapping old values to new values
+mutation_mapping <- c("Frame_Shift_Del" = "frameshift",
+                      "Missense_Mutation" = "missense",
+                      "Splice_Site" = "splice",
+                      "Frame_Shift_Ins" = "frameshift", 
+                      "not_sequenced" = "not_sequenced")
+
+# Replace values in the specified columns
+mutations$BRCA1_somatic <- mutation_mapping[mutations$BRCA1_somatic]
+mutations$BRCA2_somatic <- mutation_mapping[mutations$BRCA2_somatic]
+mutations$TP53 <- mutation_mapping[mutations$TP53]
+mutations$PALB2 <- mutation_mapping[mutations$PALB2]
+```
+
+
+```{r}
+# read in data_ratio table
+de_table <- read.delim(fragment_ratio_differential)
+
+# read in sample metadata
+samples <- read_excel(samples, sheet="April22")
+### Import data (Starting with the 5Mb ratios)
+data_ratio <- read.csv(data_ratio, header=TRUE, check.names=FALSE)
+
+
+# remove PALB2 samples 
+data_ratio <- data_ratio[, !grepl("TGL49_0311", colnames(data_ratio))]
+#remove failed samples
+data_ratio <- data_ratio[, !colnames(data_ratio) %in% c("CHARMQ_0788_Pl_T_PG_T-788", "CHARMQ_0207_Pl_T_PG_T-207")]
+
+samples <- samples[samples$'Library Name' %in% colnames(data_ratio), ]
+#remove failed samples
+samples <- samples[!grepl("CHARMQ_0788_Pl_T_PG_T-788", samples$`Library Name`), ]
+samples <- samples[!grepl("CHARMQ_0207_Pl_T_PG_T-207", samples$`Library Name`), ]
+
+# read in healthy fragment ratio data
+data_normal <- read.csv(data_healthy, header=TRUE, check.names=FALSE)
+```
+
+```{r}
+# remove the fragment ratio chromosome location that seems to be noise 
+# data_ratio <- data_ratio[!(data_ratio$seqnames == "chr6" & data_ratio$start == "30100000"),]
+# data_normal <- data_normal[!(data_normal$seqnames == "chr6" & data_normal$start == "30100000"),]
+```
+
+```{r}
+### Set chromosomes
+data_chr <- data_ratio[, c("seqnames", "arm", "start", "end")]
+row.names(data_chr) <- with(data_chr, paste0(seqnames, "_", start))
+
+row.names(data_ratio) <- with(data_ratio, paste0(seqnames, "_", start))
+data_ratio <- as.matrix(data_ratio[, -c(1:5)])
+
+row.names(data_normal) <- with(data_normal, paste0(seqnames, "_", start))
+data_normal <- as.matrix(data_normal[, -c(1:5)])
+
+data_healthy_and_cancer_merged <- cbind(data_ratio, data_normal) 
+```
+
+```{r}
+samples <- subset(samples, select = c("Library Name", "source"))
+
+# change samples Library Name column to sample 
+colnames(samples)[colnames(samples) == "Library Name"] <- "sample"
+colnames(samples)[colnames(samples) == "source"] <- "cancer_status"
+```
+
+```{r}
+# 1) get all sample names from data_normal, excluding columns 1:5
+hbc_samples <- colnames(data_normal)
+
+# 2) create a tibble of new rows with cancer_status = "HBC"
+new_rows <- tibble(
+  sample       = hbc_samples,
+  cancer_status = "HBC"
+)
+
+# 3) bind to your existing samples
+samples <- bind_rows(samples, new_rows)
+```
+
+```{r}
+## Set samples to graph and order factors
+samples$sample <- as.factor(samples$sample)
+samples$cancer_status <- factor(samples$cancer_status,
+                                     levels = c("first_positive_survivor_no", "cancer_status_positive_survivor_yes", "cancer_status_negative_survivor_no", "cancer_status_negative_survivor_yes", "HBC"),
+                                     labels = c("Cancer Positive (First Positive)", "Cancer Positive (Survivor Yes)", "Cancer Negative (Survivor No)", "Cancer Negative (Survivor Yes)", "Healthy"))
+```
+
+```{r}
+# Match IDs with your data_ratio column names
+valid_libs_disease <- intersect(scores$ID, colnames(data_ratio))
+scores <- scores[scores$ID %in% valid_libs_disease, ]
+
+# Create named vectors of tumour fractions
+tf_disease <- setNames(scores$Tumour.Fraction, scores$ID)
+tf_healthy <- setNames(scores_normal$Tumour.Fraction, scores_normal$ID)
+
+# Combine and scale
+tf_all <- c(tf_disease, tf_healthy) * 100
+
+# Create dataframe
+tf_df <- data.frame(
+  sample = names(tf_all),
+  TumourFraction = as.numeric(tf_all),
+  stringsAsFactors = FALSE
+)
+
+tf_df_joined <- left_join(tf_df, mutations, by = "sample")
+
+# Ensure same row order
+tf_df <- tf_df_joined[match(tf_df$sample, tf_df_joined$sample), ]
+```
+
+
+```{r}
+# Merge into samples by “sample”
+samples <- samples %>%
+  mutate(sample = as.character(sample)) %>%
+  left_join(tf_df, by = "sample") %>%
+  arrange(cancer_status, TumourFraction, BRCA1_somatic, BRCA2_somatic, TP53, PALB2)
+
+
+# Define the mutation columns (adjust if needed)
+mutation_cols <- c("BRCA1_somatic", "BRCA2_somatic", "TP53", "PALB2")
+
+# Set mutation columns to "NS" for healthy samples
+samples[samples$cancer_status == "Healthy", mutation_cols] <- "not_sequenced"
+# Set NA to "NS" for non-Healthy rows in mutation columns
+samples[samples$cancer_status != "Healthy", mutation_cols] <- lapply(
+  samples[samples$cancer_status != "Healthy", mutation_cols],
+  function(x) ifelse(is.na(x), "NS", x)
+)
+
+data_corr_df <- data.frame(
+  TumourFraction  = samples$TumourFraction,
+  LOD_TF          = rep((100*tumour_fraction_cutoff), nrow(samples)),
+  BRCA1_somatic   = samples$BRCA1_somatic,
+  BRCA2_somatic   = samples$BRCA2_somatic,
+  TP53            = samples$TP53,
+  PALB2           = samples$PALB2,
+  vaf_BRCA1_somatic = samples$vaf_BRCA1_somatic,
+  vaf_BRCA2_somatic = samples$vaf_BRCA2_somatic,
+  vaf_TP53 = samples$vaf_TP53,
+  vaf_PALB2 = samples$vaf_PALB2,
+  stringsAsFactors = FALSE
+)
+
+
+rownames(data_corr_df) <- samples$sample
+
+# samples <- samples[, !names(samples) %in% c("TumourFraction", "BRCA1_somatic", "BRCA2_somatic", "TP53", "PALB2")]
+```
+
+```{r}
+### Set clinical information
+data_status <- as.matrix(samples$cancer_status)
+row.names(data_status) <- samples$sample
+```
+
+```{r}
+### Format DE table
+de_table <- de_table[order(factor(de_table$location, levels = row.names(data_ratio))), ]
+```
+
+```{r}
+### Make matrix for healthy median
+normal <- de_table[, c("healthy_median", "healthy_sd")]
+colnames(normal) <- c("median", "sd")
+row.names(normal) <- de_table$location
+```
+
+```{r}
+### Calculate the correlation between healthy median and samples
+corr_normal <- corr.test(data_normal, normal$median)[["r"]]
+fragment_ratio_cutoff <- quantile(corr_normal, 0.01, na.rm = TRUE)
+
+data_corr <- corr.test(as.matrix(data_ratio), normal$median)[["r"]]
+data_corr <- rbind(data_corr, corr_normal)
+```
+
+```{r}
+### Calculate the distance from the healthy median
+data_change <- (data_healthy_and_cancer_merged - normal$median)/normal$sd
+```
+
+```{r}
+### Set Median change of HBOC cohort from HBCs
+data_freq <- de_table$z_score_negative
+data_freq <- as.matrix(data_freq)
+row.names(data_freq) <- row.names(data_change)
+```
+
+```{r}
+data_freq2 <- data_change
+data_freq2 <- ifelse(data_freq2 > 3 | data_freq2 < -3, 1, 0)
+data_freq2 <- (rowSums2(as.matrix(data_freq2), na.rm = TRUE)/ncol(data_freq2))*100
+data_freq2 <- as.matrix(data_freq2)
+row.names(data_freq2) <- row.names(data_change)
+```
+
+```{r}
+# order <- row.names(data_change)
+# data_status    <- data_status[sample_order, , drop = FALSE]
+
+```
+
+
+```{r}
+normal_median <- as.matrix(normal$median)
+row.names(normal_median) <- row.names(data_change)
+```
+
+```{r}
+### Set annotation and heatmap colours
+col_heat <- colorRamp2(c(-6, -3, 0, 3, 6), 
+                      c("#1f78b4", "white", "white", "white", "#e31a1c"))
+col_fun <- colorRamp2(c(-3, 0, 3), 
+                      c("#1f78b4", "white", "#e31a1c"))
+col_fun2 <- colorRamp2(c(0, 50), 
+                       c("white", "#e31a1c"))
+col_fun3 <- colorRamp2(c(0, 1), 
+                       c("white", "#e31a1c"))
+col_status <- c("Cancer Positive (First Positive)"= "#f87544", "Cancer Negative (Survivor No)" = "#9467bd", "Cancer Positive (Survivor Yes)" = "#f4c842", "Cancer Negative (Survivor Yes)" = "#1f77b4", "Healthy" = "#B2DF8A")
+
+col <- c(missense = "#4DAF4A", missense2 = "#4DAF4A", frameshift = "black", stop = "#A65628",
+         deletion = "#377EB8", splice_site = "#984EA3", NS = "white", not_sequenced = "grey65")
+```
+
+
+```{r}
+# 1) Reorder data_corr to match data_corr_df’s rownames
+data_corr_matched <- data_corr[rownames(data_corr_df), , drop = FALSE]
+
+stopifnot(identical(rownames(data_corr_df), rownames(data_corr_matched)))
+
+# 2) Now assign
+data_corr_df$correlation <- as.numeric(data_corr_matched)
+data_corr_df$LOD         <- fragment_ratio_cutoff
+```
+
+```{r}
+## Set chromosome order
+armlevels <- c("1p","1q","2p","2q","3p","3q","4p","4q","5p","5q","6p","6q",
+               "7p","7q","8p","8q", "9p", "9q","10p","10q","11p","11q","12p",
+               "12q","13q","14q","15q","16p","16q","17p","17q","18p","18q",
+               "19p", "19q","20p","20q","21q","22q")
+data_chr$arm <- factor(data_chr$arm, levels=armlevels)
+data_chr$arm <- factor(data_chr$arm, levels=armlevels,
+                       labels = c("","1"," ","2","  ","3","   ","4","    ","5","     ","6",
+                                  "      ","7","       ","8", "        ", "9","         ","10","          ","11", "           ",
+                                  "12","13","14","15","            ","16", "             ","17","              ","18",
+                                  "               ", "19", "                ", "20","                   ","22"))
+
+
+```
+
+```{r}
+# Add a 'sample' column to data_corr_df
+data_corr_df$sample <- rownames(data_corr_df)
+
+# Merge correlation back into samples
+samples <- samples %>%
+  left_join(data_corr_df[, c("sample","correlation")], by = "sample")
+
+# Recompute sample_order including correlation
+sample_order <- samples %>%
+  arrange(
+    cancer_status,
+    TumourFraction,
+    desc(correlation), 
+    BRCA1_somatic,
+    BRCA2_somatic,
+    TP53,
+    PALB2
+  ) %>%
+  pull(sample)
+```
+
+
+
+```{r}
+## Set column/row order and column/row splits
+chr_order     <- row.names(data_change)
+column_split  <- data_chr$arm
+
+sample_order_chr <- as.character(sample_order)
+
+data_change <- data_change[, sample_order_chr, drop = FALSE]
+
+data_change <- t(data_change)
+
+data_status <- data_status[sample_order_chr, , drop = FALSE]
+
+# 4) reorder your annotation data frame
+data_corr_df <- data_corr_df[sample_order_chr, , drop = FALSE]
+```
+
+
+```{r}
+anno_name_order <- c(
+  "Correlation \nto Healthy", "  ",
+  "Tumour\nFraction", "   ",
+  "BRCA1", "BRCA2", "TP53", "PALB2", " "
+)
+
+gene_labels <- c("BRCA1","BRCA2","TP53","PALB2")
+fontface_vec <- ifelse(anno_name_order %in% gene_labels, "italic", "plain")
+
+right_annotation <- rowAnnotation(
+  # 1) Correlation
+  "Correlation \nto Healthy" = anno_lines(
+    data_corr_df[, c("correlation", "LOD")],
+    add_points = TRUE,
+    pch = c(16, NA),
+    gp = gpar(col = c(NA, "red"), lty = c("solid", "dashed")),
+    pt_gp = gpar(col = c("black", NA)),
+    size = unit(1, "mm"),
+    ylim = c(1, 0),
+    axis_param = list(at = c(0, 0.5, 1), labels = c("0","0.5","1"),
+                      side = "bottom", labels_rot = 0, gp = gpar(fontsize = 10)),
+    border = FALSE
+  ),
+
+  "  " = anno_empty(which = "row", border = FALSE, width = unit(2, "mm")),
+
+  # 2) Tumour fraction
+  "Tumour\nFraction" = anno_lines(
+    data_corr_df[, c("TumourFraction","LOD_TF",
+                     "vaf_BRCA1_somatic","vaf_BRCA2_somatic","vaf_TP53","vaf_PALB2")],
+    add_points = TRUE,
+    pch = c(16, NA, 4, 4, 4, 4),
+    gp  = gpar(col = c(NA, "red", rep("transparent", 4)),
+               lty = c("solid","dashed", rep("blank", 4))),
+    pt_gp = gpar(col = c("black", NA, rep("red", 4))),
+    size = unit(1, "mm"),
+    axis_param = list(side = "bottom", labels_rot = 0, gp = gpar(fontsize = 10)),
+    border = FALSE
+  ),
+
+  "   " = anno_empty(which = "row", border = FALSE, width = unit(2, "mm")),
+
+  # 3) Mutations
+  BRCA1 = anno_simple(data_corr_df$BRCA1_somatic, col = col, simple_anno_size = unit(2, "mm")),
+  BRCA2 = anno_simple(data_corr_df$BRCA2_somatic, col = col, simple_anno_size = unit(2, "mm")),
+  TP53  = anno_simple(data_corr_df$TP53,          col = col, simple_anno_size = unit(2, "mm")),
+  PALB2 = anno_simple(data_corr_df$PALB2,         col = col, simple_anno_size = unit(2, "mm")),
+  " "   = anno_empty(which = "row", border = FALSE, width = unit(1, "mm")),
+
+  # names: only genes italic
+  annotation_name_side = "bottom",
+  annotation_name_gp   = gpar(fontsize = 10.5, fontface = fontface_vec),
+  border               = FALSE,
+  width                = unit(9, "cm")
+)
+```
+
+```{r}
+top_annotation <- HeatmapAnnotation("Healthy Median" = anno_lines(normal_median,
+                                                          ylim = c(-0.08, 0.08),
+                                                          axis_param = list(at = c(-0.05, 0, 0.05),
+                                                                            side = "right",
+                                                                            labels_rot = 0,
+                                                                            gp = gpar(fontsize = 10)),
+                                                          border = FALSE),
+                                    #"Differential Regions" = data_freq3,
+                                    #"% HBOC >3 SD" = data_freq2,
+                                    #"HBOC Cohort Median" = data_freq,
+                                    #col = list(#"HBOC Cohort Median" = col_fun,
+                                               #"% HBOC >3 SD" = col_fun2),
+                                               #"Differential Regions" = col_fun3),
+                                    border = FALSE,
+                                    height = unit(2, "cm"),
+                                    show_annotation_name = TRUE,
+                                    annotation_name_side = "right",
+                                    annotation_name_rot = 0,
+                                    annotation_name_gp = gpar(fontsize = 11),
+                                    simple_anno_size = unit(0.5, "cm"))
+```
+
+
+
+```{r}
+annotation_legend = packLegend(
+  list = list(
+    # Cancer Status in 2 rows
+    Legend(
+      title       = "Cancer Status",
+      at          = c(
+        "Cancer Positive (First Positive)",
+        "Cancer Positive (Survivor Yes)",
+        "Cancer Negative (Survivor No)",
+        "Cancer Negative (Survivor Yes)",
+        "Healthy"
+      ),
+      legend_gp   = gpar(fill = c(
+        "#f87544","#f4c842","#9467bd","#1f77b4","#B2DF8A"
+      )),
+      title_gp    = gpar(fontsize = fs_legend_title),
+      labels_gp   = gpar(fontsize = fs_legend_labels),
+      grid_height = unit(2, "mm"),
+      grid_width  = unit(3.5, "mm"),
+      nrow        = 5,
+      by_row      = TRUE
+    ),
+       Legend(
+      title = "Somatic Mutation",
+      at = c("Missense", "Frameshift", "Not Sequenced"),
+      legend_gp = gpar(fill = c("#4DAF4A", "black", "grey65")),
+      grid_height = unit(2, "mm"),
+      grid_width  = unit(4, "mm"),
+      title_gp    = gpar(fontsize = fs_legend_title),
+      labels_gp   = gpar(fontsize = fs_legend_labels),
+      ncol = 1               # 6 items → 3 columns × 2 rows
+    ),
+      # Fragment Ratio & Tumour Fraction LOD
+    # 1) Tumour Fraction LOD (dashed red line)
+    Legend(
+      title    = "",
+      graphics = list(
+        function(x, y, w, h) grid.lines(x = unit.c(x - w*0.4, x + w*0.4), y = unit.c(y, y), gp = gpar(col = "red", lty = "dashed", lwd = 2)),
+        function(x, y, w, h) grid.points(x = x, y = y, pch = 4, size = unit(3, "mm"), gp = gpar(col = "red"))
+      ),
+      labels       = c("Tumour Fraction &\nFragment Ratio LOD", "Mutation VAF"),
+      title_gp     = gpar(fontsize = fs_legend_title),
+      labels_gp    = gpar(fontsize = fs_legend_labels),
+      direction    = "horizontal",
+      grid_height  = unit(2, "mm"),
+      grid_width   = unit(3.5,   "mm"),
+      background   = "white"
+   ),
+
+    # SD from Healthy (Heatmap)
+    Legend(
+      title        = "SD from Healthy\n(Heatmap)",
+      at           = c(-6, -3, 0, 3, 6),
+      col_fun      = col_heat,
+      title_gp     = gpar(fontsize = fs_legend_title),
+      labels_gp    = gpar(fontsize = fs_legend_labels),
+      direction    = "horizontal",
+      grid_height  = unit(2, "mm"),
+      legend_width = unit(2, "cm")
+    )
+
+    # SD from Healthy (HBOC Median)
+    # Legend(
+    #   title        = "SD from Healthy\n(HBOC Median)",
+    #   at           = c(-3, 0, 3),
+    #   col_fun      = col_fun,
+    #   title_gp     = gpar(fontsize = fs_legend_title),
+    #   labels_gp    = gpar(fontsize = fs_legend_labels),
+    #   direction    = "horizontal",
+    #   grid_height  = unit(2, "mm"),
+    #   legend_width = unit(2, "cm")
+    # ),
+
+    # % of Cohort >3 SD
+    # Legend(
+    #   title        = "% of Cohort",
+    #   at           = c(0, 50),
+    #   col_fun      = col_fun2,
+    #   title_gp     = gpar(fontsize = fs_legend_title),
+    #   labels_gp    = gpar(fontsize = fs_legend_labels),
+    #   direction    = "horizontal",
+    #   grid_height  = unit(2, "mm"),
+    #   legend_width = unit(2, "cm")
+    # )
+
+  
+  ),
+  
+  direction = "horizontal",
+  gap = unit(15, "mm"),    # increase spacing between legends
+  annotation_legend_width = unit(10, "cm")  # widen all annotation legend
+)
+```
+
+```{r}
+### Set additional annotations
+left_annotation <- rowAnnotation("Cancer Status" = data_status,
+                                 #show_annotation_name = TRUE,
+                                 border = FALSE,
+                                 col = list("Cancer Status" = col_status),
+                                 annotation_name_gp = gpar(fontsize = 14),
+                                 annotation_name_side = "top",
+                                 annotation_name_rot = 90,
+                                 #simple_anno_size = unit(0.25, "cm"),
+                                 show_legend = c(FALSE, FALSE, FALSE, FALSE, FALSE))
+```
+
+```{r}
+# Optional sanity check – these must be identical
+stopifnot(identical(rownames(data_change), rownames(data_status)))
+
+#  4) now define row_split exactly as before
+row_split <- samples$cancer_status
+row_split <- factor(
+  row_split,
+  levels = c(
+    "Cancer Positive (First Positive)",
+    "Cancer Positive (Survivor Yes)",
+    "Cancer Negative (Survivor No)",
+    "Cancer Negative (Survivor Yes)",
+    "Healthy"
+  )
+)
+row_order_explicit <- rownames(data_change)
+```
+
+
+```{r}
+
+## Generate oncoprint
+pdf(file.path(outdir, "02_figure_fragment_ratio_heatmap_to_publish.pdf"), height = 7.5, width = 13)
+ht <- Heatmap(data_change,
+                   col = col_heat,
+                   show_row_names = FALSE,
+                   show_column_names = FALSE,
+                   show_heatmap_legend = FALSE,
+                   row_order = row_order_explicit,
+                   row_names_gp      = gpar(fontsize = fs_row_names),     
+                   top_annotation = top_annotation,
+                   left_annotation = left_annotation,
+                   right_annotation = right_annotation,
+                   column_order = chr_order,
+                   row_labels = NULL,
+                   column_split = column_split,
+                   row_split = row_split,
+                   column_title_gp = gpar(fontsize = 12),
+                   row_title_gp = gpar(fontsize = 0),
+                   row_title_rot = 0, 
+                   #Rowv = NA,
+                   # row_dend_width = unit(2, "cm"),
+                   cluster_row_slices = FALSE,
+                   border = FALSE,
+                   show_row_dend = FALSE)
+ht <- draw(
+  ht,
+  heatmap_legend_list  = annotation_legend,  # use your packed legend as the heatmap’s legend
+  show_annotation_legend = FALSE,            # don’t draw any “annotation legends”
+  show_heatmap_legend    = TRUE,             # but do draw the “heatmap legends”
+  heatmap_legend_side    = "bottom",          # on the bottom of the device
+  
+)
+dev.off()
+```
+
+```{r}
+### Print out correlation scores
+data_corr <- as.data.frame(data_corr)
+data_corr$sample <- row.names(data_corr)
+colnames(data_corr) <- c("correlation", "sample")
+
+write.table(
+  data_corr, 
+  file = file.path(data_path_out, paste0("02_fragment_ratio_genome_healthy_correlation.txt")),
+  sep = "\t",
+  row.names = FALSE
+)
+```
+
+```{r}
+pdf(file.path(outdir,"02_fragment_ratio_legend_only.pdf"), width = 10, height = 1.1)
+grid.newpage()                 # start a fresh page
+grid.draw(annotation_legend)   # draw only the legend
+dev.off()
+```
+
+```{r}
+ht
+```
