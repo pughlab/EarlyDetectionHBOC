@@ -2,13 +2,10 @@
 
 ## Overview
 This repository contains the complete data-processing pipeline used to generate all figures, analyses, and results for the manuscript *Early Cancer Detection in Hereditary Breast and Ovarian Cancer Syndrome with Cell-Free DNA*.  
-The pipeline runs end-to-end automatically: it prepares directories, checks and installs required packages, retrieves raw data if missing, executes all analysis modules, and produces processed data tables, publication-ready figures, and HTML reports.
+The pipeline runs end-to-end automatically: it prepares directories, checks and installs required packages, executes all analysis modules, and produces processed data tables, publication-ready figures, and HTML reports.
 
 ## Data
-Raw input data will be available soon on Zenodo:  
-[https://zenodo.org](https://zenodo.org)
-
-If the `raw_data/` folder is missing, the pipeline will automatically download and unzip the dataset.
+Please see the *Data and Code Availability* section in the Manuscript for the Zenodo link and download the `raw_data` input from Zenodo.
 
 ## Repository Structure
 
@@ -36,7 +33,11 @@ git clone https://github.com/pughlab/EarlyDetectionHBOC.git
 cd EarlyDetectionHBOC
 ```
 
-### 3. Install Required R Packages
+
+### 3. Download Raw Data
+Download `raw_data.zip` from Zenodo (*see link in Code and Data Availability*), unzip it, and place the resulting `raw_data/` directory in the project root.
+
+### 4. Install Required R Packages
 ```bash
 Rscript Install_Packages.R
 ```
@@ -48,8 +49,7 @@ This script verifies and installs all necessary R package dependencies.
 Rscript run_all_scripts.R
 ```
 
-During execution, the pipeline will automatically:
-- download and extract the raw data from Zenodo if `raw_data/` is missing  
+During execution, the pipeline will automatically:  
 - generate processed datasets (`data/`)  
 - produce publication-ready figures (`figures/`)  
 - write rendered reports (`HTML/`)
